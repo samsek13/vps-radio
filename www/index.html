@@ -1021,6 +1021,20 @@ async function refreshNP() {
       if (s.source.name === "soundcloud" && dir.startsWith("likes:")) {
         const user = dir.slice("likes:".length) || "我";
         src = (src ? src + " · " : "") + user + " 的 Likes";
+      } else if (s.source.name === "bilibili") {
+        if (dir.startsWith("video:")) src = (src ? src + " · " : "") + "视频";
+        else if (dir.startsWith("fav:")) src = (src ? src + " · " : "") + "收藏夹";
+        else if (dir.startsWith("season:")) src = (src ? src + " · " : "") + "合集";
+        else if (dir === "search") src = (src ? src + " · " : "") + "搜索点播";
+      } else if (s.source.name === "youtube") {
+        if (dir.startsWith("video:")) src = (src ? src + " · " : "") + "视频";
+        else if (dir.startsWith("playlist:")) src = (src ? src + " · " : "") + "歌单";
+        else if (dir === "search") src = (src ? src + " · " : "") + "搜索点播";
+      } else if (s.source.name === "bandcamp") {
+        if (dir.startsWith("track:")) src = (src ? src + " · " : "") + "单曲";
+        else if (dir.startsWith("album:")) src = (src ? src + " · " : "") + "专辑";
+        else if (dir.startsWith("artist:")) src = (src ? src + " · " : "") + "艺人全库";
+        else if (dir === "search") src = (src ? src + " · " : "") + "搜索点播";
       } else {
         const ctxMap = s.source.name === "soundcloud" ? SC_CTX_NAMES : CTX_NAMES;
         for (const [k, v] of Object.entries(ctxMap)) {
@@ -1032,8 +1046,11 @@ async function refreshNP() {
       ? s.source.idx + "/" + s.source.total : "";
     let track = "";
     if (s.source && s.source.file) {
-      if (s.source.name === "netease" || s.source.name === "soundcloud") track = s.source.file.split(" ").slice(1).join(" ") || s.source.file;
-      else track = s.source.file.split("/").pop();
+      if (s.source.name === "netease" || s.source.name === "soundcloud" || s.source.name === "bilibili" || s.source.name === "youtube" || s.source.name === "bandcamp") {
+        track = s.source.file.split(" ").slice(1).join(" ") || s.source.file;
+      } else {
+        track = s.source.file.split("/").pop();
+      }
     } else if (s.source && s.source.name === "spotify") {
       track = "Spotify 同步";
     }
