@@ -1,0 +1,1024 @@
+#!/usr/bin/env python3
+"""radio-admin — VPS Radio 管理面板后端
+仅监听 127.0.0.1:8811, 由 Caddy /admin 反代并加 basic_auth (服务自身再带 Bearer 校验双层防护)。
+依赖: python3 标准库 + 已部署的 netease-helper / qrencode; radiod 在跑 (cmd.fifo 存在)。
+
+端点:
+  GET  /                  → 管理面板页 (admin-panel.html, 与本文件同目录部署)
+  GET  /api/status        → 放播状态 (source.state 解析) + 服务活性 + 网易登录布尔
+  GET  /api/library       → 媒体库文件列表
+  GET  /api/netease-status→ 网易云登录态原文
+  GET  /api/netease-login-qr      → qrencode PNG 二维码 (X-QR-Key 头带 unikey)
+  GET  /api/netease-login-check?key= → 单次扫码状态轮询 {code}
+  POST /api/command       → {cmd, args} 白名单映射写 cmd.fifo
+  POST /api/netease-search→ {q} 代理 netease-helper search
+"""
+import json
+import re
+import shlex
+import subprocess
+import threading
+import time
+import urllib.parse
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+LISTEN = ("127.0.0.1", 8811)
+CMD_FIFO = Path("/run/radiod/cmd.fifo")
+STATE_FILE = Path("/run/radiod/source.state")
+CMD_RESULT_FILE = Path("/run/radiod/cmd.result")
+NETEASE_CACHE = Path("/run/radiod/netease_search.cache")
+NETEASE_PODCAST_CACHE = Path("/run/radiod/netease_podcast_search.cache")
+SC_CACHE = Path("/run/radiod/soundcloud_search.cache")
+BILI_CACHE = Path("/run/radiod/bilibili_search.cache")
+BILI_HELPER = Path("/usr/local/bin/bilibili-helper")
+YT_CACHE = Path("/run/radiod/youtube_search.cache")
+YT_HELPER = Path("/usr/local/bin/youtube-helper")
+BC_CACHE = Path("/run/radiod/bandcamp_search.cache")
+BC_HELPER = Path("/usr/local/bin/bandcamp-helper")
+MEDIA_DIR = Path("/var/lib/radiod/media")
+NETEASE_COOKIE = Path("/var/lib/radiod/netease_cookie")
+HELPER = "/usr/local/bin/netease-helper"
+SC_HELPER = "/usr/local/bin/soundcloud-helper"
+TOKEN_FILE = Path("/var/lib/radiod/admin_token")
+PANEL_HTML = Path(__file__).with_name("admin-panel.html")
+
+# ---- 在线人数统计 ----
+# 每次客户端调 /np 时更新; 优先使用客户端上报的 cid (避免同一浏览器多标签重复计入)
+# 若旧版客户端未刷新没有 cid, 则以客户端真实 IP (X-Forwarded-For) 兜底计入
+LISTENER_TTL = 60          # 秒; 客户端轮询间隔 12s, 5 次未到即视为断线
+_listeners: dict[str, tuple[float, str]] = {}   # {key: (last_seen_ts, ip)}
+_listeners_lock = threading.Lock()
+
+# ---- 音频放大器 (服务端总线增益) ----
+VOL_FILE = Path("/var/lib/radiod/bus_volume")
+ZMQ_ADDR = "tcp://127.0.0.1:5555"
+
+def get_volume() -> float:
+    try:
+        val = float(VOL_FILE.read_text().strip())
+        return round(val, 2)
+    except (OSError, ValueError):
+        return 1.0
+
+def send_zmq_volume(vol: float) -> tuple[bool, str]:
+    try:
+        import zmq
+        ctx = zmq.Context.instance()
+        sock = ctx.socket(zmq.REQ)
+        sock.setsockopt(zmq.RCVTIMEO, 2000)
+        sock.setsockopt(zmq.SNDTIMEO, 2000)
+        sock.setsockopt(zmq.LINGER, 500)
+        sock.connect(ZMQ_ADDR)
+        sock.send_string(f"volume@vol volume {vol}")
+        reply = sock.recv_string()
+        sock.close()
+        if "Success" in reply or reply.startswith("0"):
+            return True, "ok"
+        return False, reply
+    except Exception as e:
+        return False, str(e)
+
+
+# ---- 命令白名单: 前端按钮 → cmd.fifo 行 (参数已在本服务校验过再映射) ----
+ALLOWED_COMMANDS = {
+    "spotify": lambda a: "switch-to-spotify",
+    "folder": lambda a: f"switch-to-folder {shlex.quote(a[0])} {a[1] if len(a) > 1 else 'loop'}",
+    "file": lambda a: f"switch-to-file {a[0]}" + (f" {a[1]}" if len(a) > 1 and a[1] else ""),
+    "netease-playlist": lambda a: f"switch-to-netease playlist {a[0]} {a[1] if len(a) > 1 else 'loop'}",
+    "netease-album": lambda a: f"switch-to-netease album {a[0]} {a[1] if len(a) > 1 else 'loop'}",
+    "netease-podcast": lambda a: f"switch-to-netease podcast {a[0]} {a[1] if len(a) > 1 else 'seq'}",
+    "netease-program": lambda a: f"switch-to-netease program {a[0]} {a[1] if len(a) > 1 else 'repeat'}",
+    "netease-song": lambda a: f"switch-to-netease song {a[0]} {a[1] if len(a) > 1 else 'repeat'}",
+    "netease-fm": lambda a: "switch-to-netease fm",
+    "netease-daily": lambda a: "switch-to-netease daily",
+    "netease-play": lambda a: f"switch-to-netease search {a[0]} {a[1] if len(a) > 1 else 'repeat'}",
+    "netease-podcast-play": lambda a: f"switch-to-netease podcast {a[0]} {a[1] if len(a) > 1 else 'seq'}",
+    "soundcloud-likes": lambda a: f"switch-to-soundcloud likes {a[0]} {a[1] if len(a) > 1 else 'loop'}",
+    "soundcloud-playlist": lambda a: f"switch-to-soundcloud playlist {a[0]} {a[1] if len(a) > 1 else 'loop'}",
+    "soundcloud-track": lambda a: f"switch-to-soundcloud track {a[0]} {a[1] if len(a) > 1 else 'repeat'}",
+    "soundcloud-play": lambda a: f"switch-to-soundcloud search {a[0]} {a[1] if len(a) > 1 else 'repeat'}",
+    "bilibili-video": lambda a: f"switch-to-bilibili video {a[0]} {a[1] if len(a) > 1 else 'repeat'}",
+    "bilibili-fav": lambda a: f"switch-to-bilibili fav {a[0]} {a[1] if len(a) > 1 else 'loop'}",
+    "bilibili-season": lambda a: f"switch-to-bilibili season {a[0]} {a[1] if len(a) > 1 else 'loop'}",
+    "bilibili-play": lambda a: f"switch-to-bilibili search {a[0]} {a[1] if len(a) > 1 else 'repeat'}",
+    "youtube-smart": lambda a: f"switch-to-youtube {a[0]} {a[1]} {a[2] if len(a) > 2 else 'loop'}",
+    "youtube-video": lambda a: f"switch-to-youtube video {a[0]} {a[1] if len(a) > 1 else 'repeat'}",
+    "youtube-playlist": lambda a: f"switch-to-youtube playlist {a[0]} {a[1] if len(a) > 1 else 'loop'}",
+    "youtube-play": lambda a: f"switch-to-youtube search {a[0]} {a[1] if len(a) > 1 else 'repeat'}",
+    "bandcamp-smart": lambda a: f"switch-to-bandcamp {a[0]} {a[1]} {a[2] if len(a) > 2 else 'loop'}",
+    "bandcamp-track": lambda a: f"switch-to-bandcamp track {a[0]} {a[1] if len(a) > 1 else 'repeat'}",
+    "bandcamp-album": lambda a: f"switch-to-bandcamp album {a[0]} {a[1] if len(a) > 1 else 'loop'}",
+    "bandcamp-artist": lambda a: f"switch-to-bandcamp artist {a[0]} {a[1] if len(a) > 1 else 'loop'}",
+    "bandcamp-play": lambda a: f"switch-to-bandcamp search {a[0]} {a[1] if len(a) > 1 else 'loop'}",
+    "mode": lambda a: f"mode {a[0]}",
+    "skip": lambda a: "skip",
+    "seek": lambda a: f"seek {a[0]}",
+    "volume": lambda a: f"volume {a[0]}",
+}
+# 数字 id 参数命令 (arg0 必须纯数字)
+NUM_ID_CMDS = {
+    "netease-playlist", "netease-album", "netease-podcast", "netease-program", "netease-song", "netease-play",
+    "soundcloud-playlist", "soundcloud-track", "soundcloud-play", "bilibili-play", "youtube-play", "bandcamp-play"
+}
+# order 参数命令
+ORDER_CMDS = {
+    "folder", "netease-playlist", "netease-album", "netease-podcast", "netease-program", "netease-song",
+    "netease-play", "netease-podcast-play", "soundcloud-likes", "soundcloud-playlist", "soundcloud-track",
+    "soundcloud-play", "bilibili-video", "bilibili-fav", "bilibili-season", "bilibili-play",
+    "youtube-smart", "youtube-video", "youtube-playlist", "youtube-play",
+    "bandcamp-smart", "bandcamp-track", "bandcamp-album", "bandcamp-artist", "bandcamp-play"
+}
+# 用户 permalink 参数命令 (arg0 = [A-Za-z0-9_-]+)
+PERMALINK_CMDS = {"soundcloud-likes"}
+SC_DEFAULT_LIKES = "plusdrei"   # soundcloud-likes 无参时的默认用户 (与 radioctl 一致)
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+SC_CID_FILE = Path("/var/lib/radiod/soundcloud_cid")
+
+
+def get_soundcloud_cid() -> str:
+    try:
+        for line in SC_CID_FILE.read_text().splitlines():
+            parts = line.strip().split()
+            if len(parts) >= 2 and len(parts[1]) >= 20:
+                return parts[1]
+    except OSError:
+        pass
+    return "Pb72ranhoyt6gw7hM7TkzUItXlMWSNSo"
+
+
+def resolve_netease_input(raw: str) -> tuple[str, str]:
+    """解析网易云输入：支持纯数字 ID、直接链接、短链 (163cn.tv/163.fm) 以及 App 复制的完整分享文本。
+    返回 (numeric_id, inferred_type)。inferred_type 可能为 'playlist'/'album'/'podcast'/'program'/'song' 或 ''。
+    """
+    text = raw.strip()
+    if re.fullmatch(r"\d+", text):
+        return text, ""
+
+    m = re.search(r"https?://[^\s)）]+", text)
+    if not m:
+        m_id = re.search(r"(?:id|rid)=(\d+)", text)
+        if m_id:
+            return m_id.group(1), ""
+        raise ValueError("未找到有效网易云链接或数字 ID")
+
+    url = m.group(0)
+    inferred_type = ""
+    if "分享歌单" in text or "/playlist" in url:
+        inferred_type = "playlist"
+    elif "分享专辑" in text or "/album" in url:
+        inferred_type = "album"
+    elif "分享播客" in text or "分享声音" in text or "/djradio" in url or "/podcast" in url:
+        inferred_type = "podcast"
+    elif "分享单曲" in text or "/song" in url:
+        inferred_type = "song"
+    elif "分享节目" in text or "/program" in url:
+        inferred_type = "program"
+
+    m_id = re.search(r"[?&](?:id|rid)=(\d+)", url)
+    if not m_id:
+        m_id = re.search(r"/(?:playlist|album|program|song)/(\d+)", url)
+
+    # 遇到短链 (163cn.tv, 163.fm) 或 URL 中尚无明确 ID 时，通过 GET 请求跟踪 302 重定向
+    if not m_id or "163cn.tv" in url or "163.fm" in url:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                final_url = resp.geturl()
+        except Exception as e:
+            raise ValueError(f"解析网易云短链重定向失败: {e}")
+
+        m_id = re.search(r"[?&](?:id|rid)=(\d+)", final_url)
+        if not m_id:
+            m_id = re.search(r"/(?:playlist|album|program|song)/(\d+)", final_url)
+
+        if "/playlist" in final_url:
+            inferred_type = "playlist"
+        elif "/album" in final_url:
+            inferred_type = "album"
+        elif "/djradio" in final_url or "/podcast" in final_url:
+            inferred_type = "podcast"
+        elif "/program" in final_url:
+            inferred_type = "program"
+        elif "/song" in final_url:
+            inferred_type = "song"
+
+    if not m_id:
+        raise ValueError(f"未能从网易云链接中提取到有效 ID: {raw[:60]}")
+
+    return m_id.group(1), inferred_type
+
+
+def resolve_soundcloud_input(raw: str) -> tuple[str, str]:
+    """解析 SoundCloud 输入：支持纯数字 ID、直接完整链接、移动端 m. 链接、短链 (on.soundcloud.com)、
+    以及从分享嵌入代码 (iframe/api.soundcloud.com/playlists/xxx 或 tracks/xxx) 中提取 ID。
+    返回 (numeric_id, inferred_kind)，inferred_kind 可为 'playlist'/'track'/''。
+    """
+    text = raw.strip()
+    if re.fullmatch(r"\d+", text):
+        return text, ""
+
+    # 支持直接从 embed 代码或 soundcloud://playlists/xxx 或 tracks/xxx 中提取
+    m_pl = re.search(r"(?:playlists[:/]|playlists%2F)(\d+)", text)
+    if m_pl:
+        return m_pl.group(1), "playlist"
+    m_tr = re.search(r"(?:tracks[:/]|tracks%2F)(\d+)", text)
+    if m_tr:
+        return m_tr.group(1), "track"
+
+    m = re.search(r"(?:https?://)?(?:[a-zA-Z0-9-]+\.)?soundcloud\.com/[^\s\"'<>]+", text)
+    if not m:
+        raise ValueError("未找到有效 SoundCloud 链接或 ID")
+
+    url = m.group(0)
+    if not url.startswith("http://") and not url.startswith("https://"):
+        url = "https://" + url
+
+    # 短链重定向 (如 on.soundcloud.com)
+    if "on.soundcloud.com" in url:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                url = resp.geturl()
+        except Exception as e:
+            raise ValueError(f"解析 SoundCloud 短链失败: {e}")
+
+    url = url.replace("m.soundcloud.com", "soundcloud.com")
+
+    m_pl = re.search(r"(?:playlists[:/]|playlists%2F)(\d+)", url)
+    if m_pl:
+        return m_pl.group(1), "playlist"
+    m_tr = re.search(r"(?:tracks[:/]|tracks%2F)(\d+)", url)
+    if m_tr:
+        return m_tr.group(1), "track"
+
+    # 优先调用 SoundCloud API /resolve 端点
+    cid = get_soundcloud_cid()
+    q = urllib.parse.quote(url, safe="")
+    api_url = f"https://api-v2.soundcloud.com/resolve?url={q}&client_id={cid}"
+
+    try:
+        req = urllib.request.Request(api_url, headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+            pid = data.get("id")
+            kind = data.get("kind", "")
+            if pid:
+                return str(pid), kind
+    except Exception as e:
+        # Fallback: 页面 HTML 抓取 __sc_hydration 或 soundcloud://
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                html = resp.read().decode("utf-8", errors="ignore")
+                m1 = re.search(r'soundcloud://playlists:(\d+)|["\']id["\']:(\d+),["\']kind["\']:["\']playlist["\']', html)
+                if m1:
+                    return (m1.group(1) or m1.group(2)), "playlist"
+                m2 = re.search(r'soundcloud://tracks:(\d+)|["\']id["\']:(\d+),["\']kind["\']:["\']track["\']', html)
+                if m2:
+                    return (m2.group(1) or m2.group(2)), "track"
+        except Exception:
+            pass
+        raise ValueError(f"解析 SoundCloud 链接失败: {e}")
+
+    raise ValueError("未能从 SoundCloud 链接中获取到有效 ID")
+
+
+def resolve_soundcloud_id(raw: str) -> str:
+    return resolve_soundcloud_input(raw)[0]
+
+
+def resolve_soundcloud_user(raw: str) -> str:
+    """提取 SoundCloud 用户名：支持直接用户名或完整主页链接。"""
+    text = raw.strip()
+    if re.fullmatch(r"[A-Za-z0-9_-]+", text):
+        return text
+    m = re.search(r"soundcloud\.com/([A-Za-z0-9_-]+)/?", text)
+    if m:
+        return m.group(1)
+    return text
+
+
+def resolve_youtube_input(raw: str) -> tuple[str, str]:
+    """
+    智能解析 YouTube 输入。
+    返回 (target_id_or_url, inferred_type: 'video' | 'playlist')
+    """
+    raw = raw.strip().strip("'\"")
+    # 提取 http(s) URL
+    m_url = re.search(r"https?://[^\s)）'\"<>]+", raw)
+    if m_url:
+        u = m_url.group(0)
+        try:
+            parsed = urllib.parse.urlparse(u)
+            qs = urllib.parse.parse_qs(parsed.query)
+
+            # 1. 明确的歌单路径
+            if parsed.path.rstrip("/") in ("/playlist", "/watch_videos"):
+                list_id = qs.get("list", [""])[0]
+                return (list_id or u), "playlist"
+
+            # 2. 带有 list 参数的 watch
+            list_id = qs.get("list", [""])[0]
+            video_id = qs.get("v", [""])[0]
+            if list_id and not list_id.startswith("RD"):
+                return list_id, "playlist"
+            elif video_id:
+                return video_id, "video"
+
+            # 3. 单视频 watch
+            if video_id:
+                return video_id, "video"
+
+            # 4. youtu.be
+            if parsed.netloc in ("youtu.be", "www.youtu.be"):
+                parts = parsed.path.strip("/").split("/")
+                if parts and parts[0]:
+                    return parts[0], "video"
+
+            # 5. /shorts/
+            if "/shorts/" in parsed.path:
+                m_s = re.search(r"/shorts/([A-Za-z0-9_-]+)", parsed.path)
+                if m_s:
+                    return m_s.group(1), "video"
+
+            # 6. /live/
+            if "/live/" in parsed.path:
+                m_l = re.search(r"/live/([A-Za-z0-9_-]+)", parsed.path)
+                if m_l:
+                    return m_l.group(1), "video"
+
+            return u, "video"
+        except Exception:
+            return u, "video"
+
+    # 非 URL:
+    if re.match(r"^(PL|OLAK|UU|FL)[A-Za-z0-9_-]+$", raw):
+        return raw, "playlist"
+    if re.match(r"^[A-Za-z0-9_-]{11}$", raw):
+        return raw, "video"
+
+    return raw, "video"
+
+
+def resolve_bandcamp_input(raw: str) -> tuple[str, str]:
+    """
+    智能解析 Bandcamp 输入。
+    返回 (clean_url, inferred_type: 'track' | 'album' | 'artist')
+    """
+    raw = raw.strip().strip("'\"")
+    m_url = re.search(r"https?://[^\s)）'\"<>]+", raw)
+    url = m_url.group(0) if m_url else raw
+    idx = url.rfind("https://")
+    if idx <= 0:
+        idx = url.rfind("http://")
+    if idx > 0:
+        url = url[idx:]
+    if not (url.startswith("http://") or url.startswith("https://")):
+        url = f"https://{url.lstrip('/')}"
+    parsed = urllib.parse.urlparse(url)
+    path = parsed.path.rstrip("/")
+    if "/track/" in path:
+        return url, "track"
+    elif "/album/" in path:
+        return url, "album"
+    else:
+        return url, "artist"
+
+
+def parse_time_point(raw: str) -> str | None:
+    """解析并标准化时间点字符串为 HH:MM:SS 或 MM:SS 格式。
+    支持:
+      - 纯秒数: 90, 90s, 90.5
+      - 分秒: 1:30, 01:30
+      - 时分秒: 1:15:30, 01:15:30
+      - 常见简写: 1m30s, 1h20m10s
+    返回合法的 ffmpeg -ss 参数格式 (如 '00:01:30' 或 '01:15:30')，失败返回 None。
+    """
+    raw = raw.strip()
+    if not raw:
+        return None
+
+    # 1. 尝试 1h20m15s / 1m30s / 90s 等格式
+    m_hms = re.fullmatch(r"^(?:(\d+)\s*h(?:ours?)?)?\s*(?:(\d+)\s*m(?:in(?:ute)?s?)?)?\s*(?:(\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?)?$", raw, re.IGNORECASE)
+    if m_hms and any(m_hms.groups()):
+        h_str, m_str, s_str = m_hms.groups()
+        h = int(h_str) if h_str else 0
+        m = int(m_str) if m_str else 0
+        s = float(s_str) if s_str else 0.0
+        total_sec = h * 3600 + m * 60 + s
+        h_out = int(total_sec // 3600)
+        m_out = int((total_sec % 3600) // 60)
+        s_out = int(total_sec % 60)
+        return f"{h_out:02d}:{m_out:02d}:{s_out:02d}"
+
+    # 2. 尝试纯数字/纯秒数 (例如 "90", "120.5")
+    m_num = re.fullmatch(r"^\d+(?:\.\d+)?$", raw)
+    if m_num:
+        total_sec = float(raw)
+        h_out = int(total_sec // 3600)
+        m_out = int((total_sec % 3600) // 60)
+        s_out = int(total_sec % 60)
+        return f"{h_out:02d}:{m_out:02d}:{s_out:02d}"
+
+    # 3. 尝试冒号分隔格式: [H:]M:S 或 H:M:S.xxx (例如 01:30, 1:30, 01:15:30)
+    m_colon = re.fullmatch(r"^(?:(\d+):)?(\d{1,2}):(\d{1,2})(?:\.\d+)?$", raw)
+    if m_colon:
+        h_str, m_str, s_str = m_colon.groups()
+        h = int(h_str) if h_str is not None else 0
+        m = int(m_str)
+        s = int(s_str)
+        if s >= 60:
+            m += s // 60
+            s = s % 60
+        if m >= 60:
+            h += m // 60
+            m = m % 60
+        return f"{h:02d}:{m:02d}:{s:02d}"
+
+    return None
+
+
+def read_token():
+    try:
+        return TOKEN_FILE.read_text().strip()
+    except OSError:
+        return ""
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "radio-admin/1.0"
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        print(f"[{time.strftime('%H:%M:%S')}] {self.address_string()} {fmt % args}", flush=True)
+
+    # ---- 响应工具 ----
+    def _json(self, code, obj, extra_headers=None):
+        body = json.dumps(obj, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        for k, v in (extra_headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _bytes(self, code, body, ctype, extra_headers=None):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        for k, v in (extra_headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _authed(self) -> bool:
+        # 内层: Bearer token (外层 Caddy basic_auth 之外的第二道)
+        auth = self.headers.get("Authorization", "")
+        token = read_token()
+        return bool(token) and auth == f"Bearer {token}"
+
+    # ---- GET ----
+    def do_GET(self):
+        # /np: 公开只读 now-playing (播放页音源/曲目显示用, 无敏感信息, 免 Bearer)
+        # 输出与 /api/status 的 source 段一致但剥离其余 (服务活性/登录态不出公网)
+        # ?cid=<uuid> 由客户端带来, 用于统计在线人数 (每 12s 轮询一次, TTL=60s)
+        # 兼容旧客户端: 未刷新/未带 cid 时，以真实 IP (X-Forwarded-For) 自动兜底计入
+        if self.path == "/np" or self.path.startswith("/np?"):
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            cid = (qs.get("cid") or [None])[0]
+            client_ip = (self.headers.get("X-Forwarded-For") or self.client_address[0]).split(",")[0].strip()
+            now = time.time()
+            with _listeners_lock:
+                if cid:
+                    _listeners[f"cid_{cid}"] = (now, client_ip)
+                else:
+                    # 旧版客户端（无 cid）：若该 IP 在 60s 内未关联过任何 cid，则按 IP 兜底计入
+                    has_cid = any(
+                        ip == client_ip and k.startswith("cid_")
+                        for k, (ts, ip) in _listeners.items()
+                        if now - ts <= LISTENER_TTL
+                    )
+                    if not has_cid:
+                        _listeners[f"ip_{client_ip}"] = (now, client_ip)
+
+                # 清理超时条目
+                expired = [k for k, (ts, _) in _listeners.items() if now - ts > LISTENER_TTL]
+                for k in expired:
+                    del _listeners[k]
+                count = len(_listeners)
+            st = radio_status()
+            self._json(200, {"source": st.get("source"), "listeners": count})
+            return
+
+        if not self._authed():
+            self._json(401, {"error": "unauthorized"})
+            return
+        if self.path == "/" or self.path == "/index.html":
+            try:
+                self._bytes(200, PANEL_HTML.read_bytes(), "text/html; charset=utf-8")
+            except OSError:
+                self._json(500, {"error": "panel html missing"})
+        elif self.path == "/api/status":
+            st = radio_status()
+            st["_now"] = int(time.time())
+            self._json(200, st)
+        elif self.path == "/api/library":
+            self._json(200, library())
+        elif self.path == "/api/netease-status":
+            self._json(200, netease_status())
+        elif self.path == "/api/soundcloud-status":
+            self._json(200, soundcloud_status())
+        elif self.path == "/api/netease-login-qr":
+            self.api_netease_qr()
+        elif self.path.startswith("/api/netease-login-check"):
+            self.api_netease_login_check()
+        else:
+            self._json(404, {"error": "not found"})
+
+    # ---- POST ----
+    def do_POST(self):
+        if not self._authed():
+            self._json(401, {"error": "unauthorized"})
+            return
+        if self.path == "/api/command":
+            self.api_command()
+        elif self.path == "/api/volume":
+            self.api_volume()
+        elif self.path == "/api/netease-search":
+            self.api_netease_search()
+        elif self.path == "/api/netease-podcast-search":
+            self.api_netease_podcast_search()
+        elif self.path == "/api/soundcloud-search":
+            self.api_soundcloud_search()
+        elif self.path == "/api/bilibili-search":
+            self.api_bilibili_search()
+        elif self.path == "/api/youtube-search":
+            self.api_youtube_search()
+        elif self.path == "/api/bandcamp-search":
+            self.api_bandcamp_search()
+        else:
+            self._json(404, {"error": "not found"})
+
+    def _read_json(self):
+        try:
+            return json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        except (ValueError, KeyError):
+            return None
+
+    # ---- 端点实现 ----
+    def api_command(self):
+        req = self._read_json()
+        if not isinstance(req, dict):
+            return self._json(400, {"error": "bad json"})
+        cmd, args = req.get("cmd", ""), req.get("args", [])
+        if cmd not in ALLOWED_COMMANDS:
+            return self._json(400, {"error": f"unknown cmd: {cmd}"})
+        if not isinstance(args, list) or not all(isinstance(x, str) for x in args):
+            return self._json(400, {"error": "args must be list of strings"})
+        if len(args) > 2:
+            return self._json(400, {"error": "too many args"})
+        # 智能解析: NetEase 分享文本/短链/链接，或 SoundCloud 完整链接/短链/嵌入代码
+        if cmd in ("netease-playlist", "netease-album", "netease-podcast", "netease-program", "netease-song") and args:
+            try:
+                resolved_id, inferred_type = resolve_netease_input(args[0])
+                args[0] = resolved_id
+                if inferred_type in ("playlist", "album", "podcast", "program", "song"):
+                    target_cmd = f"netease-{inferred_type}"
+                    if target_cmd in ALLOWED_COMMANDS:
+                        cmd = target_cmd
+            except ValueError as e:
+                return self._json(400, {"error": str(e)})
+
+        elif cmd == "netease-podcast-play":
+            try:
+                lines = [l.strip() for l in NETEASE_PODCAST_CACHE.open() if l.strip()]
+            except OSError:
+                lines = []
+            if not lines:
+                return self._json(400, {"error": "无播客搜索缓存, 请先搜索播客"})
+            try:
+                idx = int(args[0])
+            except (ValueError, IndexError):
+                return self._json(400, {"error": "序号需为整数"})
+            if idx < 0 or idx >= len(lines):
+                return self._json(400, {"error": f"序号超出播客搜索结果 (共 {len(lines)} 条)"})
+            target_line = lines[idx]
+            pod_id = target_line.split()[0]
+            ord_choice = args[1] if len(args) > 1 and args[1] in ("repeat", "loop", "seq", "shuffle") else "seq"
+            cmd = "netease-podcast"
+            args = [pod_id, ord_choice]
+
+        elif cmd in ("soundcloud-playlist", "soundcloud-track") and args:
+            try:
+                resolved_id, inferred_kind = resolve_soundcloud_input(args[0])
+                args[0] = resolved_id
+                if inferred_kind in ("playlist", "track"):
+                    target_cmd = f"soundcloud-{inferred_kind}"
+                    if target_cmd in ALLOWED_COMMANDS:
+                        cmd = target_cmd
+            except ValueError as e:
+                return self._json(400, {"error": str(e)})
+
+        elif cmd == "soundcloud-likes" and args:
+            args[0] = resolve_soundcloud_user(args[0])
+
+        elif cmd == "bilibili-season" and args:
+            # 兼容两个 id 的旧传参 [mid, sid, order]
+            if len(args) >= 2 and args[0].strip().isdigit() and args[1].strip().isdigit():
+                mid = args[0].strip()
+                sid = args[1].strip()
+                ord_choice = args[2] if len(args) > 2 and args[2] in ("repeat", "loop", "seq", "shuffle") else "loop"
+                args = [f"{sid} {mid}", ord_choice]
+            else:
+                raw_target = args[0].strip().strip("'\"")
+                ord_choice = args[1] if len(args) > 1 and args[1] in ("repeat", "loop", "seq", "shuffle") else "loop"
+                m_url = re.search(r"https?://[^\s)）]+", raw_target)
+                if m_url:
+                    args = [m_url.group(0), ord_choice]
+                else:
+                    args = [raw_target, ord_choice]
+
+        elif cmd in ("bilibili-video", "bilibili-fav") and args:
+            raw_target = args[0].strip().strip("'\"")
+            ord_choice = args[1] if len(args) > 1 and args[1] in ("repeat", "loop", "seq", "shuffle") else ("repeat" if cmd == "bilibili-video" else "loop")
+            m_url = re.search(r"https?://[^\s)）]+", raw_target)
+            if m_url:
+                args = [m_url.group(0), ord_choice]
+            else:
+                args = [raw_target, ord_choice]
+
+        elif cmd == "youtube-smart" and args:
+            raw_target = args[0]
+            req_order = args[1] if len(args) > 1 and args[1] in ("repeat", "loop", "seq", "shuffle") else None
+            clean_val, inferred_kind = resolve_youtube_input(raw_target)
+            ord_choice = req_order if req_order else ("loop" if inferred_kind == "playlist" else "repeat")
+            cmd = f"youtube-{inferred_kind}"
+            args = [clean_val, ord_choice]
+
+        elif cmd in ("youtube-video", "youtube-playlist") and args:
+            raw_target = args[0]
+            clean_val, _ = resolve_youtube_input(raw_target)
+            ord_choice = args[1] if len(args) > 1 and args[1] in ("repeat", "loop", "seq", "shuffle") else ("repeat" if cmd == "youtube-video" else "loop")
+            args = [clean_val, ord_choice]
+
+        elif cmd == "bandcamp-smart" and args:
+            raw_target = args[0]
+            req_order = args[1] if len(args) > 1 and args[1] in ("repeat", "loop", "seq", "shuffle") else None
+            clean_val, inferred_kind = resolve_bandcamp_input(raw_target)
+            ord_choice = req_order if req_order else ("repeat" if inferred_kind == "track" else "loop")
+            cmd = f"bandcamp-{inferred_kind}"
+            args = [clean_val, ord_choice]
+
+        elif cmd in ("bandcamp-track", "bandcamp-album", "bandcamp-artist") and args:
+            raw_target = args[0]
+            clean_val, _ = resolve_bandcamp_input(raw_target)
+            def_ord = "repeat" if cmd == "bandcamp-track" else "loop"
+            ord_choice = args[1] if len(args) > 1 and args[1] in ("repeat", "loop", "seq", "shuffle") else def_ord
+            args = [clean_val, ord_choice]
+
+        elif cmd == "mode":
+            if not args or args[0] not in ("repeat", "loop", "seq", "shuffle"):
+                return self._json(400, {"error": "mode must be repeat|loop|seq|shuffle"})
+            try:
+                cur_src = STATE_FILE.read_text().split("|")[0].strip()
+                if cur_src == "spotify":
+                    return self._json(400, {"error": "Spotify 模式不支持播放模式切换 (请在手机 Spotify 客户端中设置)"})
+            except OSError:
+                pass
+
+        elif cmd == "seek":
+            if not args or not args[0].strip():
+                return self._json(400, {"error": "请输入指定时点 (如 01:30 或 90)"})
+            raw_time = args[0].strip()
+            norm_time = parse_time_point(raw_time)
+            if not norm_time:
+                return self._json(400, {"error": "时点格式不正确，支持 mm:ss、hh:mm:ss 或纯秒数 (如 01:30、90)"})
+            args[0] = norm_time
+            try:
+                cur_src = STATE_FILE.read_text().split("|")[0].strip()
+                if cur_src == "spotify":
+                    return self._json(400, {"error": "Spotify 模式不支持指定时点播放 (请在手机 Spotify 客户端中拖动进度条)"})
+            except OSError:
+                pass
+
+        # 数字 id 校验 (这类命令必须给 args[0])
+        if cmd in NUM_ID_CMDS:
+            if not args or not re.fullmatch(r"\d+", args[0]):
+                return self._json(400, {"error": "id must be numeric"})
+        # permalink 校验 (soundcloud-likes; 空则用默认用户)
+        if cmd in PERMALINK_CMDS:
+            if not args:
+                args = [SC_DEFAULT_LIKES]
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", args[0]):
+                return self._json(400, {"error": "bad permalink"})
+        # order 校验
+        if cmd in ORDER_CMDS and len(args) > 1 and args[1] not in ("shuffle", "seq", "repeat", "loop"):
+            return self._json(400, {"error": "order must be repeat|loop|seq|shuffle"})
+        # volume 校验
+        if cmd == "volume":
+            if not args or not re.fullmatch(r"\d+(\.\d+)?", args[0]):
+                return self._json(400, {"error": "音量倍数需为数字 (如 1.5)"})
+            v = float(args[0])
+            if v < 0.1 or v > 10.0:
+                return self._json(400, {"error": "音量倍数需在 0.1 ~ 10.0 之间"})
+            # 同时直接触发 ZMQ + 存盘，保证即刻生效
+            send_zmq_volume(v)
+            try:
+                VOL_FILE.write_text(str(v))
+            except OSError:
+                pass
+        # 路径类: file/folder 限媒体库内 (必须有 args[0])
+        if cmd in ("file", "folder"):
+            if not args:
+                return self._json(400, {"error": "missing path arg"})
+            p = args[0]
+            root = str(MEDIA_DIR)
+            if not (p == root or p.startswith(root + "/")) or ".." in p:
+                return self._json(400, {"error": "path outside media dir"})
+            if cmd == "file" and len(args) > 1 and args[1].strip():
+                norm_time = parse_time_point(args[1].strip())
+                if not norm_time:
+                    return self._json(400, {"error": "时点格式不正确，支持 mm:ss、hh:mm:ss 或纯秒数 (如 01:30、90)"})
+                args[1] = norm_time
+        # 搜索点歌下标越界校验 (0基): 对应缓存不存在/为空 → 先搜索; 超行数 → 明确报错。
+        # 此前越界下标在 radiod 侧静默钳到 [0,total) 头部播错歌 (2026-09-15 硬化)
+        if cmd in ("netease-play", "soundcloud-play", "bilibili-play", "youtube-play", "bandcamp-play"):
+            if cmd == "netease-play":
+                cache = NETEASE_CACHE
+            elif cmd == "bilibili-play":
+                cache = BILI_CACHE
+            elif cmd == "youtube-play":
+                cache = YT_CACHE
+            elif cmd == "bandcamp-play":
+                cache = BC_CACHE
+            else:
+                cache = SC_CACHE
+            try:
+                total = sum(1 for _ in cache.open())
+            except OSError:
+                total = 0
+            if total == 0:
+                return self._json(400, {"error": "无搜索缓存, 请先搜索"})
+            if int(args[0]) >= total:
+                return self._json(400, {"error": f"序号超出搜索结果 (共 {total} 条)"})
+        line = ALLOWED_COMMANDS[cmd](args)
+        if len(line) > 4096:
+            return self._json(400, {"error": "command too long"})
+        if not CMD_FIFO.exists():
+            return self._json(503, {"error": "radiod not running (no cmd.fifo)"})
+        try:
+            with CMD_FIFO.open("w") as f:
+                f.write(line + "\n")
+        except OSError as e:
+            return self._json(500, {"error": f"fifo write failed: {e}"})
+        print(f"command ok: {cmd} {args}", flush=True)
+        self._json(200, {"ok": True, "sent": line})
+
+    def api_volume(self):
+        req = self._read_json()
+        if not isinstance(req, dict) or "volume" not in req:
+            return self._json(400, {"error": "缺少 volume 参数"})
+        try:
+            vol = float(req["volume"])
+            if vol < 0.1 or vol > 10.0:
+                return self._json(400, {"error": "音量倍数需在 0.1 ~ 10.0 之间"})
+        except (ValueError, TypeError):
+            return self._json(400, {"error": "音量倍数需为有效数字"})
+        vol = round(vol, 2)
+        ok, msg = send_zmq_volume(vol)
+        try:
+            VOL_FILE.write_text(str(vol))
+        except OSError:
+            pass
+        # 同步向 cmd.fifo 发一条 volume 命令，方便日志与 cmd.result 保持一致
+        if CMD_FIFO.exists():
+            try:
+                with CMD_FIFO.open("w") as f:
+                    f.write(f"volume {vol}\n")
+            except OSError:
+                pass
+        if not ok:
+            return self._json(200, {"ok": True, "volume": vol, "warning": f"已存盘，但总线未立即响应: {msg}"})
+        self._json(200, {"ok": True, "volume": vol})
+
+
+    def api_netease_search(self):
+        req = self._read_json()
+        q = str(req.get("q", "")).strip() if isinstance(req, dict) else ""
+        if not q or len(q) > 128:
+            return self._json(400, {"error": "bad query"})
+        try:
+            r = subprocess.run([HELPER, "search", q], capture_output=True, text=True, timeout=30)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            return self._json(502, {"error": f"search failed: {e}"})
+        if r.returncode != 0:
+            return self._json(502, {"error": (r.stderr or r.stdout or "search failed").strip()[:300]})
+        self._json(200, {"output": r.stdout})
+
+    def api_netease_podcast_search(self):
+        req = self._read_json()
+        q = str(req.get("q", "")).strip() if isinstance(req, dict) else ""
+        if not q or len(q) > 128:
+            return self._json(400, {"error": "bad query"})
+        try:
+            r = subprocess.run([HELPER, "search-podcast", q], capture_output=True, text=True, timeout=30)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            return self._json(502, {"error": f"search failed: {e}"})
+        if r.returncode != 0:
+            return self._json(502, {"error": (r.stderr or r.stdout or "search failed").strip()[:300]})
+        self._json(200, {"output": r.stdout})
+
+    def api_soundcloud_search(self):
+        req = self._read_json()
+        q = str(req.get("q", "")).strip() if isinstance(req, dict) else ""
+        if not q or len(q) > 128:
+            return self._json(400, {"error": "bad query"})
+        try:
+            r = subprocess.run([SC_HELPER, "search", q], capture_output=True, text=True, timeout=30)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            return self._json(502, {"error": f"search failed: {e}"})
+        if r.returncode != 0:
+            return self._json(502, {"error": (r.stderr or r.stdout or "search failed").strip()[:300]})
+        self._json(200, {"output": r.stdout})
+
+    def api_bilibili_search(self):
+        req = self._read_json()
+        if not isinstance(req, dict):
+            return self._json(400, {"error": "bad json"})
+        q = (req.get("q") or "").strip()
+        if not q:
+            return self._json(400, {"error": "bad query"})
+        try:
+            r = subprocess.run([BILI_HELPER, "search", q], capture_output=True, text=True, timeout=30)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            return self._json(502, {"error": f"search failed: {e}"})
+        if r.returncode != 0:
+            return self._json(502, {"error": (r.stderr or r.stdout or "search failed").strip()[:300]})
+        self._json(200, {"output": r.stdout})
+
+    def api_youtube_search(self):
+        req = self._read_json()
+        if not isinstance(req, dict):
+            return self._json(400, {"error": "bad json"})
+        q = (req.get("q") or "").strip()
+        if not q or len(q) > 128:
+            return self._json(400, {"error": "bad query"})
+        try:
+            r = subprocess.run([str(YT_HELPER), "search", q], capture_output=True, text=True, timeout=30)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            return self._json(502, {"error": f"search failed: {e}"})
+        if r.returncode != 0:
+            return self._json(502, {"error": (r.stderr or r.stdout or "search failed").strip()[:300]})
+        self._json(200, {"output": r.stdout})
+
+    def api_bandcamp_search(self):
+        req = self._read_json()
+        if not isinstance(req, dict):
+            return self._json(400, {"error": "bad json"})
+        q = (req.get("q") or "").strip()
+        if not q or len(q) > 128:
+            return self._json(400, {"error": "bad query"})
+        try:
+            r = subprocess.run([str(BC_HELPER), "search", q], capture_output=True, text=True, timeout=20)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            return self._json(502, {"error": f"search failed: {e}"})
+        if r.returncode != 0:
+            return self._json(502, {"error": (r.stderr or r.stdout or "search failed").strip()[:300]})
+        self._json(200, {"output": r.stdout})
+
+    def api_netease_qr(self):
+        """helper login-qr-url → PNG 二维码 + unikey 头"""
+        try:
+            r = subprocess.run([HELPER, "login-qr-url"], capture_output=True, text=True, timeout=15)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            return self._json(502, {"error": f"qr failed: {e}"})
+        if r.returncode != 0:
+            return self._json(502, {"error": (r.stderr or "login-qr-url failed").strip()[:300]})
+        lines = [l for l in r.stdout.splitlines() if l.strip()]
+        if len(lines) < 2:
+            return self._json(502, {"error": "qr output malformed"})
+        key, url = lines[0], lines[1]
+        png = subprocess.run(
+            ["qrencode", "-t", "PNG", "-o", "-", "-s", "6", url],
+            capture_output=True, timeout=10,
+        )
+        if png.returncode != 0 or not png.stdout:
+            return self._json(502, {"error": "qrencode failed"})
+        self._bytes(200, png.stdout, "image/png", {"X-QR-Key": key})
+
+    def api_netease_login_check(self):
+        m = re.search(r"[?&]key=([^&]+)", self.path)
+        if not m:
+            return self._json(400, {"error": "missing key"})
+        key = m.group(1)
+        try:
+            r = subprocess.run([HELPER, "login-check", key], capture_output=True, text=True, timeout=15)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            return self._json(502, {"error": f"check failed: {e}"})
+        # rc: 0=803 成功 / 1=等待(801/802) / 24=过期
+        if r.returncode == 0:
+            self._json(200, {"code": 803, "message": "登录成功"})
+        elif r.returncode == 24:
+            self._json(200, {"code": 800, "message": "二维码已过期"})
+        elif r.returncode == 1:
+            code = r.stdout.strip() or "801"
+            self._json(200, {"code": int(code) if code.isdigit() else 801, "message": "waiting"})
+        else:
+            self._json(502, {"error": (r.stderr or r.stdout or "check failed").strip()[:300]})
+
+
+# ---- 数据采集 ----
+def radio_status():
+    st = {
+        "radiod": service_active("radiod"),
+        "mediamtx": service_active("mediamtx"),
+        "caddy": service_active("caddy"),
+        "ncm-api": service_active("ncm-api"),
+        "volume": get_volume(),
+    }
+    try:
+        fields = STATE_FILE.read_text().strip().split("|")
+        st["source"] = {
+            "name": fields[0] if len(fields) > 0 else "unknown",
+            "dir": fields[1] if len(fields) > 1 else "",
+            "file": fields[2] if len(fields) > 2 else "",
+            "idx": int(fields[3]) if len(fields) > 3 and fields[3].isdigit() else 0,
+            "total": int(fields[4]) if len(fields) > 4 and fields[4].isdigit() else 0,
+            "order": fields[5] if len(fields) > 5 else "",
+            "ts": int(fields[6]) if len(fields) > 6 and fields[6].isdigit() else 0,
+        }
+    except (OSError, ValueError):
+        st["source"] = None
+    try:
+        st["netease_logged_in"] = "MUSIC_U=" in NETEASE_COOKIE.read_text()
+    except OSError:
+        st["netease_logged_in"] = False
+    # 最近一次控制命令的处理结果 (radiod 写 cmd.result: "<ts>|<OK|FAIL>|<文本>")。
+    # 面板轮询 status 时展示 → 点播"命令送达但没播成"不再静默 (2026-09-15 搜索点歌 bug 的可见化)
+    st["last_cmd"] = None
+    try:
+        last = CMD_RESULT_FILE.read_text().strip().splitlines()[-1]
+        ts, _, rest = last.partition("|")
+        status, _, text = rest.partition("|")
+        if ts.isdigit():
+            st["last_cmd"] = {"ts": int(ts), "status": status, "text": text.strip()}
+    except (OSError, IndexError):
+        pass
+    return st
+
+
+def library():
+    out = []
+    for p in sorted(MEDIA_DIR.rglob("*")):
+        if p.is_file():
+            stat = p.stat()
+            out.append({"name": p.name, "path": str(p), "size": stat.st_size, "mtime": int(stat.st_mtime)})
+    return {"files": out}
+
+
+def netease_status():
+    try:
+        r = subprocess.run([HELPER, "login-status"], capture_output=True, text=True, timeout=15)
+        return {"output": (r.stdout or r.stderr).strip(), "logged_in": r.returncode == 0}
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return {"output": f"查询失败: {e}", "logged_in": False}
+
+
+def soundcloud_status():
+    try:
+        r = subprocess.run([SC_HELPER, "status"], capture_output=True, text=True, timeout=20)
+        return {"output": (r.stdout or r.stderr).strip(), "healthy": r.returncode == 0}
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return {"output": f"查询失败: {e}", "healthy": False}
+
+
+def service_active(name: str) -> bool:
+    try:
+        r = subprocess.run(["systemctl", "is-active", name], capture_output=True, text=True, timeout=5)
+        return r.stdout.strip() == "active"
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def main():
+    token = read_token()
+    if not token:
+        raise SystemExit(
+            f"admin_token 文件缺失/为空: {TOKEN_FILE}\n"
+            "生成: sudo sh -c 'openssl rand -hex 24 > /var/lib/radiod/admin_token && chmod 600 /var/lib/radiod/admin_token'\n"
+            "本服务仅 127.0.0.1 监听; 外层 Caddy basic_auth + 此处 Bearer 双层"
+        )
+    if not PANEL_HTML.exists():
+        raise SystemExit(f"面板页缺失: {PANEL_HTML} (admin-panel.html 需与本文件同目录)")
+    srv = ThreadingHTTPServer(LISTEN, Handler)
+    print(f"radio-admin listening on {LISTEN[0]}:{LISTEN[1]}", flush=True)
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

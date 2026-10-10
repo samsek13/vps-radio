@@ -1,0 +1,41 @@
+# radiod.service — VPS Radio (音源可热切换: Spotify / 音频文件)
+# 改动: 原 librespot|ffmpeg 直连改为中心 radiod.sh 管总线与音源
+[Unit]
+Description=VPS Radio (Spotify Connect / file source | ffmpeg bus | MediaMTX)
+Wants=mediamtx.service
+After=network.target network-online.target mediamtx.service
+
+[Service]
+Type=simple
+User=radiod
+Group=radiod
+ExecStart=/usr/local/bin/radiod.sh
+Restart=always
+RestartSec=3
+# 空闲时 MediaMTX 断开发布者 → 进程退出 → 重启, 是设计内循环, 不设次数上限
+StartLimitIntervalSec=0
+
+# radioctl (ubuntu 用户) 与 radiod 服务共享 /run/radiod
+# radio-admin.service 也声明了同名 RuntimeDirectory=radiod (共同持有, 引用计数),
+# 调整本组属性需两处同步看; 新增写方 unit 请照 radio-admin 加同名声明, 勿用 ReadWritePaths
+RuntimeDirectory=radiod
+RuntimeDirectoryMode=0775
+# 双保险: 停止时不删 /run/radiod (radio-admin 共同持有已保活; 此项确保 radiod 单独
+# 停启也不换 inode)。radiod.sh 启动本就 rm -f cmd.fifo 重建 + touch 缓存, 目录残留无副作用
+RuntimeDirectoryPreserve=yes
+
+# 媒体库: 音频文件放这里 (radiod 可读即可)
+# 首次部署时: sudo mkdir -p /var/lib/radiod/media && sudo chown radiod:radiod /var/lib/radiod/media
+StateDirectory=radiod
+
+# 最小权限加固 (librespot 无 root 长期需求; 只写自己的目录)
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/radiod
+# cleanup 有 TERM→KILL 兜底, 正常 <3s 停完; 此值只是兜底上限
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

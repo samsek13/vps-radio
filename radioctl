@@ -1,0 +1,738 @@
+#!/usr/bin/env bash
+# radioctl — VPS Radio 控制工具
+# 依赖 radiod 主脚本在跑 (systemd 拉起时才有 /run/radiod/cmd.fifo)
+# 用法:
+#   radioctl status                      # 当前音源/曲目/进度/播放列表状态
+#   radioctl mode [repeat|loop|seq|shuffle] # 切换模式 (单曲|循环|顺序|随机)
+#   radioctl spotify                     # 切到 Spotify (手机上一按播放即出声)
+#   radioctl file <绝对路径> [时点]        # 切到本地音频文件 (单曲无限循环，支持指定起始时点)
+#   radioctl folder [目录] [repeat|loop|seq|shuffle]  # 文件夹循环播放 (默认媒体库, 默认列表循环)
+#   radioctl netease login                # 网易云扫码登录 (二维码打终端)
+#   radioctl netease status               # 网易云登录态 (昵称/VIP)
+#   radioctl netease song <歌曲id或链接> [模式] # 网易云单曲点播
+#   radioctl netease playlist <歌单id或分享链接/文字> [模式]   # 网易云歌单循环
+#   radioctl netease album <专辑id或分享链接/文字> [模式]       # 网易云专辑循环
+#   radioctl netease podcast [播客id/链接] [模式] # 网易云播客循环 (无参列出已订阅)
+#   radioctl netease podcasts             # 列出已订阅播客
+#   radioctl netease podcast-sub <序号> [模式]   # 播放已订阅播客的第 n 个
+#   radioctl netease program <节目id/链接> [模式] # 播客单集播放
+#   radioctl netease fm                   # 网易云私人FM
+#   radioctl netease daily                # 网易云每日推荐
+#   radioctl netease search <关键词>      # 搜索单曲 (编号列表)
+#   radioctl netease play <序号> [模式]   # 播放上次搜索结果的第 n 首 (默认单曲循环)
+#   radioctl netease podcast-search <关键词> # 搜索播客 (编号列表)
+#   radioctl netease podcast-play <序号>  # 播放上次播客搜索结果的第 n 个
+#   radioctl soundcloud status            # SoundCloud CID 健康检查 (金丝钱探针)
+#   radioctl soundcloud track <单曲id或链接> [模式] # SoundCloud 单曲点播
+#   radioctl soundcloud likes [用户名/链接] [模式] # 播放用户 likes (默认 plusdrei)
+#   radioctl soundcloud playlist <歌单id或完整链接> [模式] # 播放 SC 歌单 (支持直接贴 URL)
+#   radioctl soundcloud search <关键词>   # 搜索 (编号列表, ✂=30s试听)
+#   radioctl soundcloud play <序号> [模式] # 播放上次搜索结果的第 n 首 (默认单曲循环)
+#   radioctl bilibili video <BV或链接> [p] [模式] # B站单视频或分P
+#   radioctl bilibili fav <收藏夹id或链接> [模式] # B站公开收藏夹循环
+#   radioctl bilibili season <合集id或链接> [模式] # B站UP主合集循环
+#   radioctl bilibili search <关键词>     # B站视频搜索 (编号列表)
+#   radioctl bilibili play <序号> [模式]  # 播放上次B站搜索结果的第 n 首
+#   radioctl youtube [链接/ID] [模式]     # YouTube 智能点播 (自动识别视频/歌单)
+#   radioctl youtube video <链接/ID> [模式] # YouTube 单视频点播
+#   radioctl youtube playlist <链接/ID> [模式] # YouTube 歌单点播
+#   radioctl youtube search <关键词>      # YouTube 视频搜索 (编号列表)
+#   radioctl youtube play <序号> [模式]   # 播放上次 YouTube 搜索结果的第 n 首
+#   radioctl bandcamp [链接] [模式]       # Bandcamp 智能点播 (自动识别单曲/专辑/艺人)
+#   radioctl bandcamp track <链接> [模式] # Bandcamp 单曲点播
+#   radioctl bandcamp album <链接> [模式] # Bandcamp 专辑循环
+#   radioctl bandcamp artist <链接> [模式] # Bandcamp 艺人全库循环
+#   radioctl bandcamp search <关键词>     # Bandcamp 搜索 (编号列表)
+#   radioctl bandcamp play <序号> [模式]  # 播放上次 Bandcamp 搜索结果的第 n 项
+#   radioctl skip                        # folder/netease/soundcloud/bilibili/youtube/bandcamp=跳到下一首, file=单曲重头播
+#   radioctl seek <时点>                 # 从指定时点播放当前曲目 (如 01:30 或 90)
+#   radioctl volume [倍数]               # 查看或设置音量放大倍数 (如 1.5)
+#   radioctl ls                          # 列出媒体库 (/var/lib/radiod/media)
+#   radioctl upload-hint                 # 提示 scp 命令行
+set -uo pipefail
+
+CMD_FIFO="/run/radiod/cmd.fifo"
+STATE_FILE="/run/radiod/source.state"
+CMD_RESULT="/run/radiod/cmd.result"   # radiod 写的最近命令处理结果 (status 末行展示)
+MEDIA_DIR="/var/lib/radiod/media"
+NETEASE_HELPER="/usr/local/bin/netease-helper"
+SEARCH_CACHE="/run/radiod/netease_search.cache"
+PODCAST_SEARCH_CACHE="/run/radiod/netease_podcast_search.cache"
+SC_HELPER="/usr/local/bin/soundcloud-helper"
+SC_SEARCH_CACHE="/run/radiod/soundcloud_search.cache"
+SC_DEFAULT_LIKES="plusdrei"       # "radioctl soundcloud likes" 不带参数时用
+BILI_HELPER="/usr/local/bin/bilibili-helper"
+BILI_SEARCH_CACHE="/run/radiod/bilibili_search.cache"
+YT_HELPER="/usr/local/bin/youtube-helper"
+YT_SEARCH_CACHE="/run/radiod/youtube_search.cache"
+BC_HELPER="/usr/local/bin/bandcamp-helper"
+BC_SEARCH_CACHE="/run/radiod/bandcamp_search.cache"
+
+usage() { sed -n '2,51p' "$0"; exit "${1:-0}"; }
+
+send() {  # 往命令 FIFO 写一行; 无 FIFO 时给出可操作提示
+    if [ ! -p "$CMD_FIFO" ]; then
+        echo "radiod 未在运行 (无 $CMD_FIFO)。请先: sudo systemctl start radiod" >&2
+        exit 1
+    fi
+    printf '%s\n' "$1" > "$CMD_FIFO" || { echo "写入命令失败" >&2; exit 1; }
+}
+
+# 绝对路径化 (radioctl 预检需要; 处理空格由协议端保证)
+abspath() {
+    case "$1" in
+        /*) printf '%s' "$1" ;;
+        *)  printf '%s' "$(cd "$(dirname "$1")" && pwd)/$(basename "$1")" ;;
+    esac
+}
+
+case "${1:-status}" in
+    status)
+        if [ -r "$STATE_FILE" ]; then
+            IFS='|' read -r name dir file idx total order ts < "$STATE_FILE"
+            ago=$(( $(date +%s) - ts ))
+            case "$name" in
+                spotify) echo "当前音源: spotify (VPS Radio in Spotify Connect)" ;;
+                file)
+                    echo "当前音源: file — 单曲循环 $(basename "$file")"
+                    echo "  $file"
+                    ;;
+                folder)
+                    echo "当前音源: folder ($order) — $dir"
+                    echo "  第 $((idx + 1))/$total 首: $(basename "$file")"
+                    ;;
+                netease)
+                    ctx_pretty="$dir"
+                    case "$dir" in
+                        playlist:*) ctx_pretty="网易歌单 #${dir#playlist:}" ;;
+                        album:*)    ctx_pretty="网易专辑 #${dir#album:}" ;;
+                        podcast:*)  ctx_pretty="网易播客 #${dir#podcast:}" ;;
+                        program:*)  ctx_pretty="网易节目 #${dir#program:}" ;;
+                        song:*)     ctx_pretty="网易单曲 #${dir#song:}" ;;
+                        fm)         ctx_pretty="私人FM" ;;
+                        daily)      ctx_pretty="每日推荐" ;;
+                        search)     ctx_pretty="搜索结果" ;;
+                    esac
+                    echo "当前音源: netease ($order) — $ctx_pretty"
+                    echo "  第 $((idx + 1))/$total 首: ${file#* } (id=${file%% *})"
+                    ;;
+                soundcloud)
+                    ctx_pretty="$dir"
+                    case "$dir" in
+                        likes:*)    ctx_pretty="Likes @${dir#likes:}" ;;
+                        playlist:*) ctx_pretty="SC歌单 #${dir#playlist:}" ;;
+                        track:*)    ctx_pretty="SC单曲 #${dir#track:}" ;;
+                        search)     ctx_pretty="搜索点歌" ;;
+                    esac
+                    echo "当前音源: soundcloud ($order) — $ctx_pretty"
+                    echo "  第 $((idx + 1))/$total 首: ${file#* } (id=${file%% *})"
+                    ;;
+                bilibili)
+                    ctx_pretty="$dir"
+                    case "$dir" in
+                        video:*)    ctx_pretty="B站视频 #${dir#video:}" ;;
+                        fav:*)      ctx_pretty="B站收藏夹 #${dir#fav:}" ;;
+                        season:*)   ctx_pretty="B站合集 #${dir#season:}" ;;
+                        search)     ctx_pretty="搜索点歌" ;;
+                    esac
+                    echo "当前音源: bilibili ($order) — $ctx_pretty"
+                    echo "  第 $((idx + 1))/$total 首: ${file#* } (id=${file%% *})"
+                    ;;
+                youtube)
+                    ctx_pretty="$dir"
+                    case "$dir" in
+                        video:*)    ctx_pretty="YouTube 视频 #${dir#video:}" ;;
+                        playlist:*) ctx_pretty="YouTube 歌单 #${dir#playlist:}" ;;
+                        search)     ctx_pretty="YouTube 搜索点歌" ;;
+                    esac
+                    echo "当前音源: youtube ($order) — $ctx_pretty"
+                    echo "  第 $((idx + 1))/$total 首: ${file#* } (id=${file%% *})"
+                    ;;
+                bandcamp)
+                    ctx_pretty="$dir"
+                    case "$dir" in
+                        album:*)    ctx_pretty="Bandcamp 专辑 #${dir#album:}" ;;
+                        track:*)    ctx_pretty="Bandcamp 单曲 #${dir#track:}" ;;
+                        artist:*)   ctx_pretty="Bandcamp 艺人 #${dir#artist:}" ;;
+                        search:*)   ctx_pretty="Bandcamp 搜索点歌" ;;
+                        search)     ctx_pretty="Bandcamp 搜索点歌" ;;
+                    esac
+                    echo "当前音源: bandcamp ($order) — $ctx_pretty"
+                    echo "  第 $((idx + 1))/$total 首: ${file#* }"
+                    ;;
+                *) echo "当前音源: $name" ;;
+            esac
+            echo "状态更新于 ${ago}s 前"
+            # 最近一次控制命令的处理结果 (radiod 写 /run/radiod/cmd.result: ts|OK/FAIL|文本)
+            if [ -r "$CMD_RESULT" ]; then
+                IFS='|' read -r _rts _rstatus _rtext < <(tail -1 "$CMD_RESULT")
+                case "$_rts" in
+                    ''|*[!0-9]*) : ;;   # 半行/坏行不显示
+                    *) [ -n "$_rtext" ] && echo "最近操作 [$_rstatus] (约 $(( $(date +%s) - _rts ))s 前): $_rtext" ;;
+                esac
+            fi
+        else
+            echo "radiod 未运行 (无 $STATE_FILE)"
+            exit 1
+        fi
+        ;;
+    spotify)    send "switch-to-spotify" ;;
+    file)
+        [ $# -ge 2 ] || { echo "用法: radioctl file <绝对路径> [时点]" >&2; exit 1; }
+        f="$(abspath "$2")"
+        if [ ! -r "$f" ]; then
+            echo "文件不可读: $f" >&2
+            exit 1
+        fi
+        ss="${3:-}"
+        if [ -n "$ss" ]; then
+            send "switch-to-file $f $ss"
+            echo "已切到文件: $f (从 $ss 开始)"
+        else
+            send "switch-to-file $f"
+            echo "已切到文件: $f"
+        fi
+        ;;
+    folder)
+        d="${2:-$MEDIA_DIR}"
+        ord="${3:-shuffle}"
+        [ "$ord" = "seq" ] || ord="shuffle"
+        d="$(abspath "$d")"
+        if [ ! -d "$d" ]; then
+            echo "目录不存在: $d" >&2
+            exit 1
+        fi
+        # find 预检而非 ls+glob: 不匹配的 glob 会以字面量传给 ls 导致误报"无音频文件"
+        if [ -z "$(find "$d" -maxdepth 1 -type f \( -iname '*.mp3' -o -iname '*.m4a' -o -iname '*.aac' -o -iname '*.flac' -o -iname '*.wav' -o -iname '*.ogg' -o -iname '*.opus' -o -iname '*.wma' \) -print -quit)" ]; then
+            echo "目录里没有音频文件: $d" >&2
+            exit 1
+        fi
+        send "switch-to-folder $d $ord"
+        ;;
+    netease)
+        sub="${2:-}"; shift 2
+        case "$sub" in
+            login)  exec "$NETEASE_HELPER" login ;;
+            status) exec "$NETEASE_HELPER" login-status ;;
+            fm)     send "switch-to-netease fm" ;;
+            daily)  send "switch-to-netease daily" ;;
+            playlist|album)
+                [ $# -ge 1 ] || { echo "用法: radioctl netease $sub <id或分享链接/文字> [shuffle|seq]" >&2; exit 1; }
+                raw="$1"; ord="${2:-shuffle}"
+                [ "$ord" = "seq" ] || ord="shuffle"
+                id="$raw"
+                if [[ ! "$id" =~ ^[0-9]+$ ]]; then
+                    id=$(python3 -c "
+import urllib.request, re, sys
+text = sys.argv[1].strip()
+m = re.search(r'https?://[^\s)）]+', text)
+if m:
+    u = m.group(0)
+    m_id = re.search(r'[?&](?:id|rid)=(\d+)', u)
+    if m_id and '163cn.tv' not in u and '163.fm' not in u:
+        print(m_id.group(1)); sys.exit(0)
+    try:
+        req = urllib.request.Request(u, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            fu = resp.geturl()
+        m_id = re.search(r'[?&](?:id|rid)=(\d+)', fu) or re.search(r'/(?:playlist|album|program|song)/(\d+)', fu)
+        if m_id: print(m_id.group(1)); sys.exit(0)
+    except Exception: pass
+m_id = re.search(r'(?:id|rid)=(\d+)', text)
+if m_id: print(m_id.group(1)); sys.exit(0)
+" "$raw" 2>/dev/null || true)
+                fi
+                case "$id" in ''|*[!0-9]*) echo "无法解析数字 ID (支持直接填 ID、完整链接或 App 分享文字): $raw" >&2; exit 1 ;; esac
+                # 预检: 列表取得到才切换 (daemon 收到命令后还会自取一次)
+                n=$("$NETEASE_HELPER" list "$sub" "$id" 2>/dev/null | grep -c .)
+                [ "${n:-0}" -gt 0 ] || { echo "$sub #$id 取不到曲目 (id 错或接口异常, 详情: journalctl -u radiod -n 20)" >&2; exit 1; }
+                echo "$sub #$id: $n 首 ($ord), 切换中 (journalctl -u radiod -f 看进度)"
+                send "switch-to-netease $sub $id $ord"
+                ;;
+            podcast)
+                if [ $# -eq 0 ]; then
+                    "$NETEASE_HELPER" list podcasts || true
+                    echo
+                    echo "用法: radioctl netease podcast <播客ID或链接> [shuffle|seq]"
+                    echo "      radioctl netease podcast-sub <序号> [shuffle|seq]  (播放上方订阅列表中的第 n 个)"
+                    exit 0
+                fi
+                id="$1"; ord="${2:-seq}"
+                [ "$ord" = "shuffle" ] || ord="seq"
+                id=$(sed -E 's/.*[?&](id|rid)=([0-9]+).*/\2/; s/.*\/([0-9]+)$/\1/' <<<"$id")
+                case "$id" in ''|*[!0-9]*) echo "播客 id 需为数字或链接: $1" >&2; exit 1 ;; esac
+                n=$("$NETEASE_HELPER" list podcast "$id" 2>/dev/null | grep -c .)
+                [ "${n:-0}" -gt 0 ] || { echo "播客 #$id 取不到曲目 (id 错或接口异常, 详情: journalctl -u radiod -n 20)" >&2; exit 1; }
+                echo "播客 #$id: $n 期 ($ord), 切换中 (journalctl -u radiod -f 看进度)"
+                send "switch-to-netease podcast $id $ord"
+                ;;
+            podcasts)
+                "$NETEASE_HELPER" list podcasts
+                ;;
+            podcast-sub)
+                if [ $# -eq 0 ]; then
+                    "$NETEASE_HELPER" list podcasts
+                    exit 0
+                fi
+                idx="$1"; ord="${2:-seq}"
+                [ "$ord" = "shuffle" ] || ord="seq"
+                case "$idx" in ''|*[!0-9]*) echo "序号需为数字: $idx" >&2; exit 1 ;; esac
+                cookie=$(tr -d '\r\n' < /var/lib/radiod/netease_cookie 2>/dev/null || true)
+                id=$(curl -s --max-time 10 "http://127.0.0.1:3000/dj/sublist?cookie=$(jq -rn --arg c "$cookie" '$c|@uri')" \
+                    | jq -r ".djRadios[$((idx - 1))].id // empty" 2>/dev/null)
+                [ -n "$id" ] || { echo "订阅序号 $idx 超出范围或未登录 (共可查已订阅播客: radioctl netease podcasts)" >&2; exit 1; }
+                n=$("$NETEASE_HELPER" list podcast "$id" 2>/dev/null | grep -c .)
+                [ "${n:-0}" -gt 0 ] || { echo "播客 #$id 取不到曲目" >&2; exit 1; }
+                echo "已选订阅第 $idx 个播客 (#$id): $n 期 ($ord), 切换中..."
+                send "switch-to-netease podcast $id $ord"
+                ;;
+            song)
+                [ $# -ge 1 ] || { echo "用法: radioctl netease song <歌曲id或链接> [repeat|loop|seq|shuffle]" >&2; exit 1; }
+                raw="$1"; ord="${2:-repeat}"
+                id=$(sed -E 's/.*[?&](id|rid)=([0-9]+).*/\2/; s/.*\/([0-9]+)$/\1/' <<<"$raw")
+                case "$id" in ''|*[!0-9]*) echo "歌曲 id 需为数字或链接: $raw" >&2; exit 1 ;; esac
+                line=$("$NETEASE_HELPER" list song "$id" 2>/dev/null)
+                [ -n "$line" ] || { echo "歌曲 #$id 不可用" >&2; exit 1; }
+                echo "网易单曲 #$id: ${line#* }, 切换中 ($ord)..."
+                send "switch-to-netease song $id $ord"
+                ;;
+            program)
+                [ $# -ge 1 ] || { echo "用法: radioctl netease program <节目id或链接> [repeat|loop|seq|shuffle]" >&2; exit 1; }
+                id="$1"; ord="${2:-repeat}"
+                id=$(sed -E 's/.*[?&](id|rid)=([0-9]+).*/\2/; s/.*\/([0-9]+)$/\1/' <<<"$id")
+                case "$id" in ''|*[!0-9]*) echo "节目 id 需为数字或链接: $1" >&2; exit 1 ;; esac
+                line=$("$NETEASE_HELPER" list program "$id" 2>/dev/null)
+                [ -n "$line" ] || { echo "节目 #$id 不可用 (详情: journalctl -u radiod -n 20)" >&2; exit 1; }
+                echo "播客单集 #$id: ${line#* }, 切换中 ($ord)..."
+                send "switch-to-netease program $id $ord"
+                ;;
+            search)
+                [ $# -ge 1 ] || { echo "用法: radioctl netease search <关键词>" >&2; exit 1; }
+                "$NETEASE_HELPER" search "$@"
+                ;;
+            play)
+                [ "$#" -ge 1 ] || { echo "用法: radioctl netease play <序号> [repeat|loop|seq|shuffle]" >&2; exit 1; }
+                idx="$1"; ord="${2:-repeat}"
+                case "$idx" in ''|*[!0-9]*) echo "序号需为数字: $idx" >&2; exit 1 ;; esac
+                [ -s "$SEARCH_CACHE" ] || { echo "无搜索缓存, 先 radioctl netease search <关键词>" >&2; exit 1; }
+                total=$(grep -c . "$SEARCH_CACHE")
+                [ "$idx" -le "$total" ] || { echo "序号超范围 (共 $total 条)" >&2; exit 1; }
+                send "switch-to-netease search $(( idx - 1 )) $ord"
+                ;;
+            podcast-search|search-podcast)
+                [ $# -ge 1 ] || { echo "用法: radioctl netease podcast-search <关键词>" >&2; exit 1; }
+                "$NETEASE_HELPER" search-podcast "$@"
+                ;;
+            podcast-play|play-podcast)
+                [ "$#" -ge 1 ] || { echo "用法: radioctl netease podcast-play <序号> [shuffle|seq]" >&2; exit 1; }
+                idx="$1"; ord="${2:-seq}"
+                [ "$ord" = "shuffle" ] || ord="seq"
+                case "$idx" in ''|*[!0-9]*) echo "序号需为数字: $idx" >&2; exit 1 ;; esac
+                [ -s "$PODCAST_SEARCH_CACHE" ] || { echo "无播客搜索缓存, 先 radioctl netease podcast-search <关键词>" >&2; exit 1; }
+                total=$(grep -c . "$PODCAST_SEARCH_CACHE")
+                [ "$idx" -le "$total" ] || { echo "序号超范围 (共 $total 条)" >&2; exit 1; }
+                target_line=$(sed -n "${idx}p" "$PODCAST_SEARCH_CACHE")
+                id="${target_line%% *}"
+                name="${target_line#* }"
+                n=$("$NETEASE_HELPER" list podcast "$id" 2>/dev/null | grep -c .)
+                [ "${n:-0}" -gt 0 ] || { echo "播客 #$id 取不到曲目" >&2; exit 1; }
+                echo "播客 #$id ($name): $n 期 ($ord), 切换中..."
+                send "switch-to-netease podcast $id $ord"
+                ;;
+            *) echo "用法: radioctl netease login|status|playlist <id>|album <id>|podcast [id]|program <id>|song <id>|fm|daily|search <关键词>|play <序号>|podcast-search <关键词>|podcast-play <序号>" >&2; exit 1 ;;
+        esac
+        ;;
+    soundcloud)
+        sub="${2:-}"; shift 2
+        case "$sub" in
+            status) exec "$SC_HELPER" status ;;
+            likes)
+                # likes [permalink] [repeat|loop|seq|shuffle]; 默认 SC_DEFAULT_LIKES (plusdrei)
+                permalink="${1:-$SC_DEFAULT_LIKES}"; ord="${2:-loop}"
+                case "$permalink" in
+                    repeat|loop|seq|shuffle) ord="$permalink"; permalink="$SC_DEFAULT_LIKES" ;;
+                esac
+                # 支持直接传入主页链接如 https://soundcloud.com/plusdrei
+                permalink=$(sed -E 's|https?://(m\.)?soundcloud\.com/||; s|/.*||' <<<"$permalink")
+                case "$permalink" in
+                    ''|*[!A-Za-z0-9_-]*) echo "用户名非法 (A-Za-z0-9_-): $permalink" >&2; exit 1 ;;
+                esac
+                n=$("$SC_HELPER" list likes "$permalink" 2>/dev/null | grep -c .)
+                [ "${n:-0}" -gt 0 ] || { echo "@$permalink 的 likes 取不到曲目" >&2; exit 1; }
+                echo "likes @$permalink: $n 首 ($ord), 切换中..."
+                send "switch-to-soundcloud likes $permalink $ord"
+                ;;
+            playlist)
+                [ $# -ge 1 ] || { echo "用法: radioctl soundcloud playlist <歌单id或完整链接> [repeat|loop|seq|shuffle]" >&2; exit 1; }
+                raw="$1"; ord="${2:-loop}"
+                id=$("$SC_HELPER" resolve-id "$raw" 2>/dev/null || true)
+                case "$id" in ''|*[!0-9]*) echo "无法解析歌单 ID (需数字或有效链接): $raw" >&2; exit 1 ;; esac
+                n=$("$SC_HELPER" list playlist "$id" 2>/dev/null | grep -c .)
+                [ "${n:-0}" -gt 0 ] || { echo "SC歌单 #$id 取不到曲目" >&2; exit 1; }
+                echo "SC歌单 #$id: $n 首可播 ($ord), 切换中..."
+                send "switch-to-soundcloud playlist $id $ord"
+                ;;
+            track)
+                [ $# -ge 1 ] || { echo "用法: radioctl soundcloud track <单曲id或完整链接> [repeat|loop|seq|shuffle]" >&2; exit 1; }
+                raw="$1"; ord="${2:-repeat}"
+                id=$("$SC_HELPER" resolve-track "$raw" 2>/dev/null || true)
+                case "$id" in ''|*[!0-9]*) echo "无法解析单曲 ID (需数字或有效链接): $raw" >&2; exit 1 ;; esac
+                line=$("$SC_HELPER" list track "$id" 2>/dev/null)
+                [ -n "$line" ] || { echo "SC单曲 #$id 取不到曲目或不可播 (详情: radioctl soundcloud status)" >&2; exit 1; }
+                echo "SC单曲 #$id: ${line#* }, 切换中 ($ord)..."
+                send "switch-to-soundcloud track $id $ord"
+                ;;
+            search)
+                [ $# -ge 1 ] || { echo "用法: radioctl soundcloud search <关键词>" >&2; exit 1; }
+                "$SC_HELPER" search "$@"
+                ;;
+            play)
+                [ "$#" -ge 1 ] || { echo "用法: radioctl soundcloud play <序号> [repeat|loop|seq|shuffle]" >&2; exit 1; }
+                idx="$1"; ord="${2:-repeat}"
+                case "$idx" in ''|*[!0-9]*) echo "序号需为数字: $idx" >&2; exit 1 ;; esac
+                [ -s "$SC_SEARCH_CACHE" ] || { echo "无搜索缓存, 先 radioctl soundcloud search <关键词>" >&2; exit 1; }
+                total=$(grep -c . "$SC_SEARCH_CACHE")
+                [ "$idx" -le "$total" ] || { echo "序号超范围 (共 $total 条)" >&2; exit 1; }
+                send "switch-to-soundcloud search $(( idx - 1 )) $ord"
+                ;;
+            *) echo "用法: radioctl soundcloud status|likes [用户名]|playlist <id>|track <id/url>|search <关键词>|play <序号>" >&2; exit 1 ;;
+        esac
+        ;;
+    bilibili|bili)
+        sub="${2:-}"; shift 2 || true
+        case "$sub" in
+            video)
+                [ $# -ge 1 ] || { echo "用法: radioctl bilibili video <BV号或链接> [p] [repeat|loop|seq|shuffle]" >&2; exit 1; }
+                raw="$1"; shift
+                p=""
+                ord="repeat"
+                if [ $# -ge 1 ]; then
+                    case "$1" in
+                        repeat|loop|seq|shuffle) ord="$1"; shift ;;
+                        [0-9]*) p="$1"; shift ;;
+                    esac
+                fi
+                if [ $# -ge 1 ]; then
+                    case "$1" in
+                        repeat|loop|seq|shuffle) ord="$1"; shift ;;
+                    esac
+                fi
+                args=("$raw")
+                [ -n "$p" ] && args+=("$p")
+                lines=$("$BILI_HELPER" list video "${args[@]}" 2>/dev/null || true)
+                [ -n "$lines" ] || { echo "无法解析或获取 B站视频: $raw" >&2; exit 1; }
+                n=$(grep -c . <<<"$lines")
+                if [ "$n" -gt 1 ]; then
+                    echo "B站分P视频: $n P ($ord), 切换中..."
+                else
+                    echo "B站视频: ${lines#* } ($ord), 切换中..."
+                fi
+                [ -n "$p" ] && raw="$raw $p"
+                send "switch-to-bilibili video $raw $ord"
+                ;;
+            fav)
+                [ $# -ge 1 ] || { echo "用法: radioctl bilibili fav <收藏夹id或链接> [repeat|loop|seq|shuffle]" >&2; exit 1; }
+                raw="$1"; ord="${2:-loop}"
+                n=$("$BILI_HELPER" list fav "$raw" 2>/dev/null | grep -c .)
+                [ "${n:-0}" -gt 0 ] || { echo "B站收藏夹取不到曲目 (可能为空或私密)" >&2; exit 1; }
+                echo "B站收藏夹: $n 首 ($ord), 切换中..."
+                send "switch-to-bilibili fav $raw $ord"
+                ;;
+            season)
+                [ $# -ge 1 ] || { echo "用法: radioctl bilibili season <合集id或链接> [mid] [repeat|loop|seq|shuffle]" >&2; exit 1; }
+                raw="$1"; shift
+                mid=""
+                ord="loop"
+                if [ $# -ge 1 ]; then
+                    case "$1" in
+                        repeat|loop|seq|shuffle) ord="$1"; shift ;;
+                        [0-9]*) mid="$1"; shift ;;
+                    esac
+                fi
+                if [ $# -ge 1 ]; then
+                    case "$1" in
+                        repeat|loop|seq|shuffle) ord="$1"; shift ;;
+                    esac
+                fi
+                args=("$raw")
+                [ -n "$mid" ] && args+=("$mid")
+                n=$("$BILI_HELPER" list season "${args[@]}" 2>/dev/null | grep -c . || true)
+                [ "${n:-0}" -gt 0 ] || { echo "B站合集取不到曲目" >&2; exit 1; }
+                echo "B站合集: $n 首 ($ord), 切换中..."
+                [ -n "$mid" ] && raw="$raw $mid"
+                send "switch-to-bilibili season $raw $ord"
+                ;;
+            search)
+                [ $# -ge 1 ] || { echo "用法: radioctl bilibili search <关键词>" >&2; exit 1; }
+                "$BILI_HELPER" search "$@"
+                ;;
+            play)
+                [ "$#" -ge 1 ] || { echo "用法: radioctl bilibili play <序号> [repeat|loop|seq|shuffle]" >&2; exit 1; }
+                idx="$1"; ord="${2:-repeat}"
+                case "$idx" in ''|*[!0-9]*) echo "序号需为数字: $idx" >&2; exit 1 ;; esac
+                [ -s "$BILI_SEARCH_CACHE" ] || { echo "无搜索缓存, 先 radioctl bilibili search <关键词>" >&2; exit 1; }
+                total=$(grep -c . "$BILI_SEARCH_CACHE")
+                [ "$idx" -le "$total" ] || { echo "序号超范围 (共 $total 条)" >&2; exit 1; }
+                send "switch-to-bilibili search $(( idx - 1 )) $ord"
+                ;;
+            *) echo "用法: radioctl bilibili video <BV/链接> [p]|fav <id/链接>|season <id/链接>|search <关键词>|play <序号>" >&2; exit 1 ;;
+        esac
+        ;;
+    youtube|yt)
+        sub="${2:-}"; shift 2 || true
+        case "$sub" in
+            video)
+                [ $# -ge 1 ] || { echo "用法: radioctl youtube video <视频链接或ID> [repeat|loop|seq|shuffle]" >&2; exit 1; }
+                raw="$1"; ord="${2:-repeat}"
+                line=$("$YT_HELPER" list video "$raw" 2>/dev/null || true)
+                [ -n "$line" ] || { echo "无法解析或获取 YouTube 视频: $raw" >&2; exit 1; }
+                vid="${line%% *}"
+                echo "YouTube 视频 #$vid: ${line#* }, 切换中 ($ord)..."
+                send "switch-to-youtube video $vid $ord"
+                ;;
+            playlist)
+                [ $# -ge 1 ] || { echo "用法: radioctl youtube playlist <歌单链接或ID> [repeat|loop|seq|shuffle]" >&2; exit 1; }
+                raw="$1"; ord="${2:-loop}"
+                lines=$("$YT_HELPER" list playlist "$raw" 2>/dev/null || true)
+                [ -n "$lines" ] || { echo "无法解析或获取 YouTube 歌单: $raw" >&2; exit 1; }
+                n=$(grep -c . <<<"$lines")
+                resolved_id=$("$YT_HELPER" resolve "$raw" 2>/dev/null | grep -o '"id": "[^"]*' | cut -d'"' -f4 || echo "$raw")
+                echo "YouTube 歌单 #$resolved_id: $n 首 ($ord), 切换中..."
+                send "switch-to-youtube playlist $resolved_id $ord"
+                ;;
+            search)
+                [ $# -ge 1 ] || { echo "用法: radioctl youtube search <关键词>" >&2; exit 1; }
+                "$YT_HELPER" search "$@"
+                ;;
+            play)
+                [ "$#" -ge 1 ] || { echo "用法: radioctl youtube play <序号> [repeat|loop|seq|shuffle]" >&2; exit 1; }
+                idx="$1"; ord="${2:-repeat}"
+                case "$idx" in ''|*[!0-9]*) echo "序号需为数字: $idx" >&2; exit 1 ;; esac
+                [ -s "$YT_SEARCH_CACHE" ] || { echo "无搜索缓存, 先 radioctl youtube search <关键词>" >&2; exit 1; }
+                total=$(grep -c . "$YT_SEARCH_CACHE")
+                [ "$idx" -le "$total" ] || { echo "序号超范围 (共 $total 条)" >&2; exit 1; }
+                send "switch-to-youtube search $(( idx - 1 )) $ord"
+                ;;
+            status)
+                which yt-dlp >/dev/null 2>&1 && echo "yt-dlp: $(yt-dlp --version 2>/dev/null)" || echo "yt-dlp: 未安装"
+                if [ -s /var/lib/radiod/youtube_cookies.txt ]; then
+                    sz=$(stat -c %s /var/lib/radiod/youtube_cookies.txt 2>/dev/null || stat -f %z /var/lib/radiod/youtube_cookies.txt 2>/dev/null)
+                    echo "Cookie: 已配置 ($sz 字节)"
+                else
+                    echo "Cookie: 未配置 (缺少 /var/lib/radiod/youtube_cookies.txt)"
+                fi
+                if [ -s /var/lib/radiod/youtube_proxy ]; then
+                    echo "代理: $(cat /var/lib/radiod/youtube_proxy 2>/dev/null)"
+                else
+                    echo "代理: 未配置 (直连)"
+                fi
+                ;;
+            cookie)
+                if [ $# -ge 1 ]; then
+                    src="$1"
+                    [ -f "$src" ] || { echo "文件不存在: $src" >&2; exit 1; }
+                    sudo install -o radiod -g radiod -m 644 "$src" /var/lib/radiod/youtube_cookies.txt
+                    echo "已成功安装 YouTube Cookie 至 /var/lib/radiod/youtube_cookies.txt"
+                else
+                    echo "=== YouTube Cookie 状态 ==="
+                    if [ -s /var/lib/radiod/youtube_cookies.txt ]; then
+                        sz=$(stat -c %s /var/lib/radiod/youtube_cookies.txt 2>/dev/null || stat -f %z /var/lib/radiod/youtube_cookies.txt 2>/dev/null)
+                        mt=$(date -r /var/lib/radiod/youtube_cookies.txt "+%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "未知")
+                        echo "Cookie 文件: 已配置 ($sz 字节, 修改时间: $mt)"
+                    else
+                        echo "Cookie 文件: 未配置 (缺少 /var/lib/radiod/youtube_cookies.txt)"
+                        echo
+                        echo "提示: 机房 VPS IP 在播放受限版权音乐（如 Tiny Desk Concert）时会触发 Google 人机拦截。"
+                        echo "配置方法:"
+                        echo "  1. 浏览器打开 YouTube，用插件 (如 Get cookies.txt LOCALLY) 导出 cookies.txt"
+                        echo "  2. 传到服务器后执行: sudo radioctl youtube cookie <cookies.txt路径>"
+                    fi
+                fi
+                ;;
+            proxy)
+                if [ $# -ge 1 ]; then
+                    p="$1"
+                    if [ "$p" = "off" ] || [ "$p" = "clear" ]; then
+                        sudo rm -f /var/lib/radiod/youtube_proxy
+                        echo "已清除 YouTube 代理设置"
+                    else
+                        printf '%s\n' "$p" | sudo install -o radiod -g radiod -m 644 /dev/stdin /var/lib/radiod/youtube_proxy
+                        echo "已设置 YouTube 代理: $p"
+                    fi
+                else
+                    echo "=== YouTube 代理状态 ==="
+                    if [ -s /var/lib/radiod/youtube_proxy ]; then
+                        echo "当前代理: $(cat /var/lib/radiod/youtube_proxy)"
+                    else
+                        echo "当前代理: 未配置 (直连)"
+                        echo "用法: radioctl youtube proxy <http://ip:port|socks5://ip:port> (设置)"
+                        echo "      radioctl youtube proxy off                                (清除)"
+                    fi
+                fi
+                ;;
+            rotate|rotate-keys|warp-rotate)
+                echo "正在轮换 Cloudflare WARP 出口 IP..."
+                warp-cli --accept-tos tunnel rotate-keys
+                echo "已成功轮换 Cloudflare WARP 出口 IP"
+                ;;
+            *)
+                # 智能识别: 如果首参数是 URL 或 ID，直接自动识别为 video 或 playlist
+                if [ -n "$sub" ]; then
+                    res=$("$YT_HELPER" resolve "$sub" 2>/dev/null || true)
+                    kind=$(grep -o '"type": "[^"]*' <<<"$res" | cut -d'"' -f4)
+                    target_id=$(grep -o '"id": "[^"]*' <<<"$res" | cut -d'"' -f4)
+                    if [ "$kind" = "playlist" ]; then
+                        ord="${1:-loop}"
+                        echo "智能识别为 YouTube 歌单 #$target_id ($ord), 切换中..."
+                        send "switch-to-youtube playlist $target_id $ord"
+                    elif [ "$kind" = "video" ]; then
+                        ord="${1:-repeat}"
+                        echo "智能识别为 YouTube 视频 #$target_id ($ord), 切换中..."
+                        send "switch-to-youtube video $target_id $ord"
+                    else
+                        echo "用法: radioctl youtube [链接/ID]|video <链接/ID>|playlist <链接/ID>|search <关键词>|play <序号>" >&2
+                        exit 1
+                    fi
+                else
+                    echo "用法: radioctl youtube [链接/ID]|video <链接/ID>|playlist <链接/ID>|search <关键词>|play <序号>" >&2
+                    exit 1
+                fi
+                ;;
+        esac
+        ;;
+    bandcamp|bc)
+        sub="${2:-}"; shift 2 || true
+        case "$sub" in
+            track)
+                [ $# -ge 1 ] || { echo "用法: radioctl bandcamp track <单曲链接> [repeat|loop|seq|shuffle]" >&2; exit 1; }
+                raw="$1"; ord="${2:-repeat}"
+                line=$("$BC_HELPER" list track "$raw" 2>/dev/null || true)
+                [ -n "$line" ] || { echo "无法解析或获取 Bandcamp 单曲: $raw" >&2; exit 1; }
+                t_url="${line%% *}"
+                echo "Bandcamp 单曲: ${line#* }, 切换中 ($ord)..."
+                send "switch-to-bandcamp track $t_url $ord"
+                ;;
+            album)
+                [ $# -ge 1 ] || { echo "用法: radioctl bandcamp album <专辑链接> [repeat|loop|seq|shuffle]" >&2; exit 1; }
+                raw="$1"; ord="${2:-loop}"
+                lines=$("$BC_HELPER" list album "$raw" 2>/dev/null || true)
+                [ -n "$lines" ] || { echo "无法解析或获取 Bandcamp 专辑: $raw" >&2; exit 1; }
+                n=$(grep -c . <<<"$lines")
+                res=$("$BC_HELPER" resolve "$raw" 2>/dev/null || true)
+                clean_url=$(grep -o '"url": "[^"]*' <<<"$res" | cut -d'"' -f4 || echo "$raw")
+                echo "Bandcamp 专辑: $n 首 ($ord), 切换中..."
+                send "switch-to-bandcamp album $clean_url $ord"
+                ;;
+            artist)
+                [ $# -ge 1 ] || { echo "用法: radioctl bandcamp artist <艺人主页链接> [repeat|loop|seq|shuffle]" >&2; exit 1; }
+                raw="$1"; ord="${2:-loop}"
+                lines=$("$BC_HELPER" list artist "$raw" 2>/dev/null || true)
+                [ -n "$lines" ] || { echo "无法解析或获取 Bandcamp 艺人全库: $raw" >&2; exit 1; }
+                n=$(grep -c . <<<"$lines")
+                res=$("$BC_HELPER" resolve "$raw" 2>/dev/null || true)
+                clean_url=$(grep -o '"url": "[^"]*' <<<"$res" | cut -d'"' -f4 || echo "$raw")
+                echo "Bandcamp 艺人全库: $n 首 ($ord), 切换中..."
+                send "switch-to-bandcamp artist $clean_url $ord"
+                ;;
+            search)
+                [ $# -ge 1 ] || { echo "用法: radioctl bandcamp search <关键词>" >&2; exit 1; }
+                "$BC_HELPER" search "$@"
+                ;;
+            play)
+                [ "$#" -ge 1 ] || { echo "用法: radioctl bandcamp play <序号> [repeat|loop|seq|shuffle]" >&2; exit 1; }
+                idx="$1"; ord="${2:-loop}"
+                case "$idx" in ''|*[!0-9]*) echo "序号需为数字: $idx" >&2; exit 1 ;; esac
+                [ -s "$BC_SEARCH_CACHE" ] || { echo "无搜索缓存, 先 radioctl bandcamp search <关键词>" >&2; exit 1; }
+                total=$(grep -c . "$BC_SEARCH_CACHE")
+                [ "$idx" -le "$total" ] || { echo "序号超范围 (共 $total 条)" >&2; exit 1; }
+                send "switch-to-bandcamp search $(( idx - 1 )) $ord"
+                ;;
+            *)
+                # 智能识别: 如果首参数是 URL，自动识别为 track / album / artist
+                if [ -n "$sub" ]; then
+                    res=$("$BC_HELPER" resolve "$sub" 2>/dev/null || true)
+                    kind=$(grep -o '"type": "[^"]*' <<<"$res" | cut -d'"' -f4)
+                    target_url=$(grep -o '"url": "[^"]*' <<<"$res" | cut -d'"' -f4)
+                    if [ "$kind" = "track" ]; then
+                        ord="${1:-repeat}"
+                        echo "智能识别为 Bandcamp 单曲 ($ord), 切换中..."
+                        send "switch-to-bandcamp track $target_url $ord"
+                    elif [ "$kind" = "album" ]; then
+                        ord="${1:-loop}"
+                        echo "智能识别为 Bandcamp 专辑 ($ord), 切换中..."
+                        send "switch-to-bandcamp album $target_url $ord"
+                    elif [ "$kind" = "artist" ]; then
+                        ord="${1:-loop}"
+                        echo "智能识别为 Bandcamp 艺人全库 ($ord), 切换中..."
+                        send "switch-to-bandcamp artist $target_url $ord"
+                    else
+                        echo "用法: radioctl bandcamp [链接]|track <链接>|album <链接>|artist <链接>|search <关键词>|play <序号>" >&2
+                        exit 1
+                    fi
+                else
+                    echo "用法: radioctl bandcamp [链接]|track <链接>|album <链接>|artist <链接>|search <关键词>|play <序号>" >&2
+                    exit 1
+                fi
+                ;;
+        esac
+        ;;
+    mode)
+        [ $# -ge 2 ] || { echo "用法: radioctl mode repeat|loop|seq|shuffle (支持别名: 单曲|循环|顺序|随机)" >&2; exit 1; }
+        if [ -r "$STATE_FILE" ]; then
+            IFS='|' read -r _name _dir _file _idx _total _order _ts < "$STATE_FILE"
+            if [ "$_name" = "spotify" ]; then
+                echo "错误: Spotify 模式不支持切换播放模式 (请在手机 Spotify 客户端中设置)" >&2
+                exit 1
+            fi
+        fi
+        m="$2"
+        case "$m" in
+            repeat|单曲|单曲循环) m="repeat" ;;
+            loop|循环|列表循环)   m="loop" ;;
+            seq|顺序|顺序播放)     m="seq" ;;
+            shuffle|随机|随机播放) m="shuffle" ;;
+            *) echo "未知模式: $m (可用: repeat|loop|seq|shuffle)" >&2; exit 1 ;;
+        esac
+        send "mode $m"
+        ;;
+    skip)       send "skip" ;;
+    seek)
+        [ $# -ge 2 ] || { echo "用法: radioctl seek <时点> (如 01:30 或 90)" >&2; exit 1; }
+        if [ -r "$STATE_FILE" ]; then
+            IFS='|' read -r _name _dir _file _idx _total _order _ts < "$STATE_FILE"
+            if [ "$_name" = "spotify" ]; then
+                echo "错误: Spotify 模式不支持指定时点 (请在手机 Spotify 中拖动进度条)" >&2
+                exit 1
+            fi
+        fi
+        send "seek $2"
+        echo "已发送从指定时点播放命令: $2"
+        ;;
+    volume)
+        if [ $# -ge 2 ]; then
+            send "volume $2"
+            echo "已发送音量调节命令: $2x"
+        else
+            cur="$(cat /var/lib/radiod/bus_volume 2>/dev/null || echo '1.0')"
+            echo "当前音量倍数: ${cur}x (设置请运行: radioctl volume <倍数>)"
+        fi
+        ;;
+    ls)
+        if [ -d "$MEDIA_DIR" ]; then
+            find "$MEDIA_DIR" -type f -printf '%10s  %p\n' | sort -k2
+        else
+            echo "$MEDIA_DIR 不存在"
+            exit 1
+        fi
+        ;;
+    upload-hint)
+        echo "从本地传文件 (两步, 服务有 PrivateTmp, /tmp 里的文件 radiod 看不见):"
+        echo "  1. scp <本地文件> ubuntu@<YOUR_VPS_IP>:/tmp/"
+        echo "  2. sudo mv /tmp/<文件> $MEDIA_DIR/ && sudo chown radiod: $MEDIA_DIR/<文件>"
+        echo "然后播放: radioctl file $MEDIA_DIR/<文件>   或整库随机: radioctl folder"
+        ;;
+    podcast)    shift; exec "$0" netease podcast "$@" ;;
+    podcasts)   shift; exec "$0" netease podcasts "$@" ;;
+    help|-h|--help) usage 0 ;;
+    *) usage 1 ;;
+esac

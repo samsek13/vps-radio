@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""radio-silence-fill — 换曲/切源空窗给音频 FIFO 垫静音
+
+radiod.sh 启动本脚本 (继承 fd 3 = 音频 FIFO 的 O_RDWR 描述符)。
+总线 ffmpeg (-re) 只按实时速率读: 空窗里没人写 → 它断粮 → HLS 不产段
+→ 听众缓冲被耗尽 (卡顿/贴边追赶)。本脚本在 gap 期间持续垫 50ms 静音块,
+让总线永远有料、时间轴不停走。
+
+gap 协议 (与 radiod.sh 约定):
+  radiod.sh 在音源死亡/切换时 touch /run/radiod/gap.on
+  本脚本在 真实源出声 (FIFO 水位 ≥HIGH) 或 30s 超时 (spotify 空闲) 时清掉它
+
+水位探测 FIONREAD: 管道内待读字节数。正常播放时真实源把管道写满
+(文件靠背压、CDN 靠突发), filler 全程只 sleep 不写, 零干扰。
+"""
+import fcntl
+import os
+import struct
+import time
+
+fd = 3                                    # 继承的音频 FIFO (radiod.sh exec 3<>)
+FIONREAD = 0x541B                         # ioctl: 管道内待读字节数
+GAP_FLAG = "/run/radiod/gap.on"
+GAP_TIMEOUT = 30                          # s: 源迟迟无声 (spotify 空闲) → 收垫回归旧行为
+CHUNK = b"\x00" * 8820                    # 50ms 静音 (44.1kHz 立体声 s16le)
+REFILL_MS = 20                            # 每块写入后歇多久 (写太快只会堆到背压满)
+
+capa = fcntl.fcntl(fd, fcntl.F_GETPIPE_SZ)   # 实际容量 (radiod.sh 扩容失败时为 64KB)
+HIGH = max(64 * 1024, capa - 32 * 1024)      # ≥HIGH: 真实源在流动
+LOW = max(16 * 1024, capa // 8)               # <LOW: 该补了
+
+gap_since = None
+while True:
+    if os.path.exists(GAP_FLAG):
+        if gap_since is None:
+            gap_since = time.time()
+        buf = bytearray(4)
+        fcntl.ioctl(fd, FIONREAD, buf, True)
+        n = struct.unpack("i", buf)[0]
+        if n >= HIGH:
+            # 真实源已出声 → 退役本轮 gap (竞速最坏交错一块 50ms 静音, 听感一次极轻 click)
+            try:
+                os.unlink(GAP_FLAG)
+            except FileNotFoundError:
+                pass
+            gap_since = None
+        elif time.time() - gap_since > GAP_TIMEOUT:
+            # 源迟迟无声 (典型: spotify 空闲没人放歌) → 收垫, 管道排空,
+            # 300s 后 mediamtx 断发布 → systemd 重启循环 (原设计, 不能被静音垫破坏)
+            try:
+                os.unlink(GAP_FLAG)
+            except FileNotFoundError:
+                pass
+            gap_since = None
+        elif n < LOW:
+            os.write(fd, CHUNK)
+            time.sleep(REFILL_MS / 1000)
+        else:
+            time.sleep(0.05)
+    else:
+        gap_since = None
+        time.sleep(0.2)

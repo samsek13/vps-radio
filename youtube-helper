@@ -1,0 +1,572 @@
+#!/usr/bin/env python3
+"""
+youtube-helper — VPS Radio YouTube 音源辅助工具
+实现:
+  - 智能 URL/文案解析 (单视频 / 歌单 / Shorts / 短链 youtu.be / 纯 ID / 手机分享长文本)
+  - 通过 yt-dlp 快速提取纯音频 DASH 直链 (WebM Opus 160k)
+  - 单视频与歌单列表批量展开
+  - 关键词搜索与原子缓存 (/run/radiod/youtube_search.cache, 0666)
+  - ffmpeg 直推 s16le 44100Hz 双声道 PCM 进入 /run/radiod/audio.fifo
+  - 超长音频 (>2h) 自动断点接力续播保护 (-ss 续播)
+"""
+import os
+import sys
+import re
+import json
+import time
+import signal
+import html
+import shutil
+import subprocess
+import urllib.parse
+
+# 确保标准输出与标准错误在任意编码环境下不崩溃
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+YT_DLP = "/usr/local/bin/yt-dlp"
+SEARCH_CACHE = "/run/radiod/youtube_search.cache"
+COOKIE_FILE = "/var/lib/radiod/youtube_cookies.txt"
+PROXY_FILE = "/var/lib/radiod/youtube_proxy"
+PLUGIN_DIRS = "/usr/local/share/yt-dlp-plugins"
+AUDIO_FIFO = "/run/radiod/audio.fifo"
+WARP_COOLDOWN_FILE = "/run/radiod/warp_rotate.cooldown"
+WARP_COOLDOWN_FALLBACK = "/tmp/radiod_warp_rotate.cooldown"
+
+
+def log(msg: str):
+    sys.stderr.write(f"youtube-helper: {msg}\n")
+    sys.stderr.flush()
+
+
+def die(msg: str, code: int = 23):
+    log(f"错误: {msg}")
+    sys.exit(code)
+
+
+def is_bot_detection(text: str) -> bool:
+    if not text:
+        return False
+    lower = text.lower()
+    return (
+        "sign in to confirm you’re not a bot" in text
+        or "sign in to confirm you're not a bot" in text
+        or ("bot" in lower and "sign in" in lower)
+        or "403: forbidden" in lower
+    )
+
+
+def is_warp_proxy() -> bool:
+    if os.path.isfile(PROXY_FILE):
+        try:
+            with open(PROXY_FILE, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                return "127.0.0.1:40000" in content or "40000" in content
+        except Exception:
+            pass
+    return False
+
+
+def trigger_warp_rotation() -> bool:
+    """若当前配置了 WARP 本地代理，自动调用 warp-cli 轮换隧道密钥获取新出口 IP。
+    包含至少 8 秒的防抖冷却，避免连续高频操作时频繁轮换。
+    """
+    if not is_warp_proxy():
+        return False
+
+    cooldown_path = WARP_COOLDOWN_FILE
+    try:
+        if not os.path.isdir(os.path.dirname(cooldown_path)):
+            cooldown_path = WARP_COOLDOWN_FALLBACK
+    except Exception:
+        cooldown_path = WARP_COOLDOWN_FALLBACK
+
+    now = time.time()
+    try:
+        if os.path.isfile(cooldown_path):
+            with open(cooldown_path, "r", encoding="utf-8") as f:
+                last_time = float(f.read().strip() or "0")
+            if now - last_time < 8.0:
+                log("Cloudflare WARP 刚轮换不久 (冷却中)，跳过本次轮换")
+                return False
+    except Exception:
+        pass
+
+    log("检测到 YouTube BotGuard 风控，正在自动轮换 Cloudflare WARP 出口 IP...")
+    try:
+        res = subprocess.run(
+            ["warp-cli", "--accept-tos", "tunnel", "rotate-keys"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if res.returncode == 0:
+            try:
+                with open(cooldown_path, "w", encoding="utf-8") as f:
+                    f.write(str(now))
+            except Exception:
+                pass
+            time.sleep(1.5)  # 等待新隧道连接就绪
+            log("Cloudflare WARP 出口 IP 轮换成功")
+            return True
+        else:
+            log(f"Cloudflare WARP 轮换失败: {res.stderr.strip()[:100]}")
+    except Exception as e:
+        log(f"调用 warp-cli 异常: {e}")
+
+    return False
+
+
+def clean_title(s: str) -> str:
+    """清洗标题中的 HTML 实体、标签、竖线、换行符，保护状态文件与面板显示。"""
+    if not s:
+        return "未知标题"
+    s = html.unescape(s)
+    s = re.sub(r"<[^>]+>", "", s)
+    s = s.replace("|", "／").replace("\r", " ").replace("\n", " ")
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def extract_url(text: str) -> str:
+    """从可能包含前缀文案的长文本中提取首个 http(s) 链接。"""
+    text = text.strip()
+    m = re.search(r"https?://[^\s)）'\"<>]+", text)
+    if m:
+        return m.group(0)
+    return text
+
+
+def parse_youtube_input(raw: str) -> tuple[str, str]:
+    """
+    智能解析用户输入。
+    返回: (type, id_or_url)
+      type 为 'video' 或 'playlist'
+      id_or_url 为清洗后的规范 ID 或直链
+    """
+    raw = raw.strip().strip("'\"")
+    url_candidate = extract_url(raw)
+
+    # 尝试作为 URL 解析
+    if url_candidate.startswith("http://") or url_candidate.startswith("https://"):
+        try:
+            parsed = urllib.parse.urlparse(url_candidate)
+            qs = urllib.parse.parse_qs(parsed.query)
+
+            # 1. 明确的歌单路径
+            if parsed.path.rstrip("/") in ("/playlist", "/watch_videos"):
+                list_id = qs.get("list", [""])[0]
+                if list_id:
+                    return "playlist", list_id
+                return "playlist", url_candidate
+
+            # 2. 带有 list 参数的 watch 链接
+            list_id = qs.get("list", [""])[0]
+            video_id = qs.get("v", [""])[0]
+            if list_id:
+                # 排除 YouTube 自动生成的动态 Radio 混合列表 (如 RD...)，RD 无法 flat-playlist 读取
+                if not list_id.startswith("RD"):
+                    return "playlist", list_id
+                elif video_id:
+                    return "video", video_id
+
+            # 3. 单视频 watch 链接
+            if video_id:
+                return "video", video_id
+
+            # 4. youtu.be 短链
+            if parsed.netloc in ("youtu.be", "www.youtu.be"):
+                path_parts = parsed.path.strip("/").split("/")
+                if path_parts and path_parts[0]:
+                    return "video", path_parts[0]
+
+            # 5. /shorts/ 链接
+            if "/shorts/" in parsed.path:
+                m_short = re.search(r"/shorts/([A-Za-z0-9_-]+)", parsed.path)
+                if m_short:
+                    return "video", m_short.group(1)
+
+            # 6. /live/ 链接
+            if "/live/" in parsed.path:
+                m_live = re.search(r"/live/([A-Za-z0-9_-]+)", parsed.path)
+                if m_live:
+                    return "video", m_live.group(1)
+
+        except Exception:
+            pass
+
+    # 非标准 URL，根据文本格式判断 ID
+    # 歌单常见前缀: PL, OLAK, UU, FL
+    if re.match(r"^(PL|OLAK|UU|FL)[A-Za-z0-9_-]+$", raw):
+        return "playlist", raw
+
+    # 11 位标准 YouTube 视频 ID
+    if re.match(r"^[A-Za-z0-9_-]{11}$", raw):
+        return "video", raw
+
+    # 默认兜底作为 video
+    return "video", raw
+
+
+def get_ytdlp_base_cmd() -> list[str]:
+    """生成 yt-dlp 基础命令参数。"""
+    cmd = [
+        YT_DLP,
+        "--no-warnings",
+        "--ignore-errors",
+    ]
+    if os.path.isdir(PLUGIN_DIRS):
+        cmd.extend(["--plugin-dirs", PLUGIN_DIRS])
+    if os.path.isfile(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 0:
+        # 规避 yt-dlp 默认回写并覆写破坏主 Cookie 文件的行为，以及非 root/radiod 运行时的权限冲突
+        try:
+            worker_cookie = f"/tmp/radiod_yt_cookie_{os.getpid()}.txt"
+            shutil.copyfile(COOKIE_FILE, worker_cookie)
+            cmd.extend(["--cookies", worker_cookie])
+        except Exception:
+            cmd.extend(["--cookies", COOKIE_FILE])
+    if os.path.isfile(PROXY_FILE) and os.path.getsize(PROXY_FILE) > 0:
+        try:
+            with open(PROXY_FILE, "r", encoding="utf-8") as f:
+                proxy = f.read().strip()
+                if proxy:
+                    cmd.extend(["--proxy", proxy])
+        except Exception:
+            pass
+    return cmd
+
+
+# ── CLI 子命令实现 ─────────────────────────────────────────────────────────
+
+def cmd_resolve(args: list[str]):
+    """解析输入，输出 JSON 结构。"""
+    if not args:
+        die("用法: youtube-helper resolve <链接/ID/文案>", 24)
+    raw = " ".join(args).strip()
+    kind, val = parse_youtube_input(raw)
+    result = {"type": kind, "id": val, "raw": raw}
+    print(json.dumps(result, ensure_ascii=False))
+
+
+def cmd_list_video(args: list[str]):
+    """输出单视频信息: '<video_id> <title>'"""
+    if not args:
+        die("用法: youtube-helper list video <视频链接/ID/文案>", 24)
+    raw = " ".join(args).strip()
+    kind, val = parse_youtube_input(raw)
+    target = f"https://www.youtube.com/watch?v={val}" if not val.startswith("http") else val
+
+    cmd = get_ytdlp_base_cmd() + [
+        "--no-playlist",
+        "--print", "%(id)s %(title)s",
+        target
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+    except subprocess.TimeoutExpired:
+        die("获取视频信息超时", 23)
+    except Exception as e:
+        die(f"执行 yt-dlp 失败: {e}", 23)
+
+    if (proc.returncode != 0 and not proc.stdout.strip()) or is_bot_detection(proc.stderr):
+        if is_bot_detection(proc.stderr) and trigger_warp_rotation():
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+            except Exception as e:
+                die(f"重试执行 yt-dlp 失败: {e}", 23)
+
+    if proc.returncode != 0 and not proc.stdout.strip():
+        die(f"无法解析视频: {proc.stderr.strip()[:200]}", 22)
+
+    lines = [l.strip() for l in proc.stdout.splitlines() if l.strip()]
+    if not lines:
+        die("视频不存在或无法获取", 22)
+
+    first = lines[0]
+    parts = first.split(" ", 1)
+    vid = parts[0]
+    title = clean_title(parts[1] if len(parts) > 1 else vid)
+    print(f"{vid} {title}")
+
+
+def cmd_list_playlist(args: list[str]):
+    """批量输出歌单曲目列表: 每行 '<video_id> <title>'"""
+    if not args:
+        die("用法: youtube-helper list playlist <歌单链接/ID/文案>", 24)
+    raw = " ".join(args).strip()
+    kind, val = parse_youtube_input(raw)
+    target = f"https://www.youtube.com/playlist?list={val}" if not val.startswith("http") else val
+
+    cmd = get_ytdlp_base_cmd() + [
+        "--flat-playlist",
+        "--print", "%(id)s %(title)s",
+        target
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        die("获取歌单信息超时", 23)
+    except Exception as e:
+        die(f"执行 yt-dlp 失败: {e}", 23)
+
+    lines = [l.strip() for l in proc.stdout.splitlines() if l.strip()]
+    if not lines and is_bot_detection(proc.stderr) and trigger_warp_rotation():
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            lines = [l.strip() for l in proc.stdout.splitlines() if l.strip()]
+        except Exception:
+            pass
+
+    valid_count = 0
+    for line in lines:
+        parts = line.split(" ", 1)
+        if not parts or not parts[0]:
+            continue
+        vid = parts[0]
+        title = clean_title(parts[1] if len(parts) > 1 else vid)
+        print(f"{vid} {title}")
+        valid_count += 1
+
+    if valid_count == 0:
+        die(f"歌单为空或不可访问: {proc.stderr.strip()[:200]}", 22)
+
+
+def cmd_search(args: list[str]):
+    """关键词搜索，输出编号列表并写入 /run/radiod/youtube_search.cache (0666)"""
+    if not args:
+        die("用法: youtube-helper search <关键词...>", 24)
+    query = " ".join(args).strip()
+
+    cmd = get_ytdlp_base_cmd() + [
+        f"ytsearch20:{query}",
+        "--flat-playlist",
+        "--print", "%(id)s\t%(title)s\t%(channel)s\t%(duration_string)s"
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
+    except subprocess.TimeoutExpired:
+        die("搜索 YouTube 超时", 23)
+    except Exception as e:
+        die(f"搜索执行失败: {e}", 23)
+
+    lines = [l.strip() for l in proc.stdout.splitlines() if l.strip()]
+    if not lines and is_bot_detection(proc.stderr) and trigger_warp_rotation():
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
+            lines = [l.strip() for l in proc.stdout.splitlines() if l.strip()]
+        except Exception:
+            pass
+
+    if not lines:
+        die(f"未找到关于 '{query}' 的 YouTube 视频", 22)
+
+    cache_lines = []
+    print(f"YouTube 视频搜索结果 (共 {len(lines)} 条):")
+    for idx, item in enumerate(lines, 1):
+        fields = item.split("\t")
+        vid = fields[0] if len(fields) > 0 else "未知"
+        title = clean_title(fields[1] if len(fields) > 1 else "未知标题")
+        channel = clean_title(fields[2] if len(fields) > 2 else "未知频道")
+        dur = fields[3] if len(fields) > 3 and fields[3] else "--:--"
+        print(f"{idx:3d}. {title} — {channel} ({dur})")
+        cache_lines.append(f"{vid} {title}\n")
+
+    # 安全写入缓存 (0666，支持跨用户读取与管理面板点歌)
+    try:
+        with open(SEARCH_CACHE, "w", encoding="utf-8") as f:
+            f.writelines(cache_lines)
+        try:
+            os.chmod(SEARCH_CACHE, 0o666)
+        except OSError:
+            pass
+        print("播放: radioctl youtube play <序号> (从 1 起)")
+    except Exception as e:
+        log(f"警告: 搜索缓存写入失败: {e}")
+
+
+def cmd_list_search_cache():
+    """输出搜索缓存内容。"""
+    if not os.path.isfile(SEARCH_CACHE):
+        die("搜索缓存不存在, 请先执行 radioctl youtube search <关键词>", 24)
+    try:
+        with open(SEARCH_CACHE, "r", encoding="utf-8") as f:
+            sys.stdout.write(f.read())
+    except Exception as e:
+        die(f"读取搜索缓存失败: {e}", 23)
+
+
+def get_audio_info(target_url: str) -> tuple[str, int]:
+    """提取纯音频流直链与时长 (秒)。"""
+    cmd = get_ytdlp_base_cmd() + [
+        "--no-playlist",
+        "--print", "%(duration)s",
+        "--print", "%(url)s",
+        "-f", "bestaudio/best",
+        target_url
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+    except subprocess.TimeoutExpired:
+        die("解析音频直链超时", 23)
+    except Exception as e:
+        die(f"解析音频直链失败: {e}", 23)
+
+    if proc.returncode != 0:
+        err = proc.stderr.strip()
+        if is_bot_detection(err) and trigger_warp_rotation():
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+                err = proc.stderr.strip()
+            except Exception:
+                pass
+
+        if proc.returncode != 0:
+            if is_bot_detection(err):
+                log("检测到 YouTube 机房 IP 访问受限 (Sign in to confirm you're not a bot)！需配置 Cookie 或代理")
+                die("YouTube 触发机房 IP 人机拦截 (未配置 /var/lib/radiod/youtube_cookies.txt 或代理)", 22)
+            die(f"获取音频直链失败: {err[:200]}", 22)
+
+    lines = [l.strip() for l in proc.stdout.splitlines() if l.strip()]
+    if len(lines) < 2:
+        die("未能解析出有效的音频直链", 22)
+
+    # 第一行为时长，第二行为 URL
+    dur_str, audio_url = lines[0], lines[1]
+    dur_sec = 0
+    try:
+        dur_sec = int(float(dur_str))
+    except (ValueError, TypeError):
+        dur_sec = 0
+
+    return audio_url, dur_sec
+
+
+def cmd_stream(args: list[str]):
+    """使用 yt-dlp 原生下载器拉取纯音频流并通过管道直推 ffmpeg 转 s16le PCM 进入 FIFO。
+    注: 规避 YouTube 对机房 IP 直接获取直链后由 ffmpeg 单独读取触发的 403 Forbidden / SABR 限制。
+    """
+    if not args:
+        die("用法: youtube-helper stream <video_id_or_url> [target_fifo] [start_time]", 24)
+    raw = args[0].strip().strip("'\"")
+    fifo = args[1].strip().strip("'\"") if len(args) > 1 else AUDIO_FIFO
+    ss = args[2].strip().strip("'\"") if len(args) > 2 else ""
+
+    kind, val = parse_youtube_input(raw)
+    target_url = f"https://www.youtube.com/watch?v={val}" if not val.startswith("http") else val
+
+    def run_pipeline():
+        ytdlp_cmd = get_ytdlp_base_cmd() + [
+            "--no-playlist",
+            "-f", "bestaudio/best",
+            "-q",
+            "--no-warnings",
+            "-o", "-",
+            target_url
+        ]
+
+        ffmpeg_cmd = [
+            "ffmpeg",
+            "-hide_banner", "-loglevel", "warning", "-nostdin", "-y",
+            "-rw_timeout", "15000000",
+        ]
+        if ss:
+            ffmpeg_cmd.extend(["-ss", ss])
+        ffmpeg_cmd.extend([
+            "-i", "pipe:0",
+            "-vn", "-map", "0:a:0",
+            "-ac", "2", "-ar", "44100", "-f", "s16le",
+            fifo
+        ])
+
+        p_dlp = subprocess.Popen(ytdlp_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        p_ff = subprocess.Popen(ffmpeg_cmd, stdin=p_dlp.stdout)
+        p_dlp.stdout.close()
+
+        def handle_signal(sig, frame):
+            try:
+                p_ff.terminate()
+            except OSError:
+                pass
+            try:
+                p_dlp.terminate()
+            except OSError:
+                pass
+            sys.exit(0)
+
+        signal.signal(signal.SIGTERM, handle_signal)
+        signal.signal(signal.SIGINT, handle_signal)
+
+        ret = p_ff.wait()
+
+        try:
+            _, err = p_dlp.communicate(timeout=3)
+        except subprocess.TimeoutExpired:
+            p_dlp.kill()
+            _, err = p_dlp.communicate()
+
+        err_text = err.decode(errors="replace").strip() if err else ""
+        return ret, err_text
+
+    ret, err_text = run_pipeline()
+
+    # 若遇到人机风控拦截且启用 WARP 代理，自动轮换出口 IP 并立即接力重试一次
+    if ret != 0 and is_bot_detection(err_text):
+        if trigger_warp_rotation():
+            log("正在以新出口 IP 重试拉流...")
+            ret, err_text = run_pipeline()
+
+    if ret != 0:
+        if is_bot_detection(err_text):
+            log("检测到 YouTube 机房 IP 访问受限 (Sign in to confirm you're not a bot)！需更新 Cookie 或配置代理")
+            sys.exit(22)
+        if err_text:
+            log(f"拉流异常: {err_text[:200]}")
+        sys.exit(ret)
+
+    sys.exit(0)
+
+
+def usage():
+    cat = """用法: youtube-helper <子命令>
+  resolve <链接/ID/文案>            智能解析类型 (video 或 playlist)
+  list video <链接/ID/文案>         单视频信息 → 1 行 "<video_id> <标题>"
+  list playlist <链接/ID/文案>      歌单曲目列表 → 每行 "<video_id> <标题>"
+  list search-cache                 输出上一次搜索结果缓存
+  search <关键词...>                搜索 YouTube 视频，显示编号列表并写缓存
+  stream <链接/ID> [fifo]           解析音频直链并推入 FIFO
+"""
+    sys.stderr.write(cat)
+    sys.exit(24)
+
+
+def main():
+    if len(sys.argv) < 2:
+        usage()
+    sub = sys.argv[1]
+    args = sys.argv[2:]
+
+    if sub == "resolve":
+        cmd_resolve(args)
+    elif sub == "list":
+        if not args:
+            die("用法: youtube-helper list video|playlist|search-cache", 24)
+        item = args[0]
+        if item == "video":
+            cmd_list_video(args[1:])
+        elif item == "playlist":
+            cmd_list_playlist(args[1:])
+        elif item == "search-cache":
+            cmd_list_search_cache()
+        else:
+            die(f"未知 list 类型: {item}", 24)
+    elif sub == "search":
+        cmd_search(args)
+    elif sub == "stream":
+        cmd_stream(args)
+    else:
+        usage()
+
+
+if __name__ == "__main__":
+    main()

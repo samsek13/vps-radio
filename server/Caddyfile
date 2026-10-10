@@ -1,0 +1,49 @@
+# VPS Radio — radio.example.com
+# 根路径 = 自托管播放页 (WHEP 主路 + HLS 备路); /admin = 管理面板 (basic_auth + Bearer 双层)
+# 媒体面 (WebRTC UDP 8189) 不走 Caddy, 不受影响
+radio.example.com {
+	# WHEP 信令 (WebRTC): 浏览器 POST /whep → mediamtx :8889 的 /live/whep
+	handle /whep* {
+		rewrite * /live/whep
+		reverse_proxy 127.0.0.1:8889
+	}
+
+	# HLS 备用 (mediamtx :8888): 路径前缀 /hls/ 剥掉后 mediamtx 看到的仍是 /live/...
+	# mediamtx HLS 有 cookieCheck 反爬: 302 Location 是绝对路径 /live/...,
+	# 会逃出 /hls/ 前缀 → header_down 改写 Location 加回前缀
+	handle_path /hls/* {
+		reverse_proxy 127.0.0.1:8888 {
+			header_down Location ^/live/(.*)$ /hls/live/$1
+		}
+	}
+
+	# Now Playing 公开只读: 播放页的音源/曲目显示 (radio-admin /np, 免鉴权, 无敏感信息)
+	handle /np {
+		reverse_proxy 127.0.0.1:8811
+	}
+
+	# 管理面板: basic_auth (外层) + radio-admin 自校验 Bearer (内层, 由 Caddy 注入)
+	handle /admin/* {
+		basic_auth {
+			# 替换为你的用户名与 caddy hash-password 生成的密码哈希
+			admin $2a$14$REPLACE_WITH_YOUR_BCRYPT_HASH
+		}
+		uri strip_prefix /admin
+		reverse_proxy 127.0.0.1:8811 {
+			# 替换为 /var/lib/radiod/admin_token 中的 token
+			header_up Authorization "Bearer REPLACE_WITH_YOUR_ADMIN_TOKEN"
+		}
+	}
+	redir /admin /admin/ 301
+
+	# 旧链接兼容: /live 与 /live/ (mediamtx 内建页时代) → 根路径
+	redir /live / 301
+	redir /live/ / 301
+
+	# 根路径: 自托管播放页
+	handle {
+		root * /var/www/jam
+		try_files {path} /index.html
+		file_server
+	}
+}

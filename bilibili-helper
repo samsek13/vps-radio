@@ -1,0 +1,677 @@
+#!/usr/bin/env python3
+"""
+bilibili-helper — VPS Radio Bilibili 音源辅助工具
+实现:
+  - 纯游客 0 账号匿名免登录解析
+  - WBI 动态签名与密钥缓存
+  - 移动端 b23.tv 短链与 App 杂乱文案提纯
+  - 单视频 / 分 P 视频 / 公开收藏夹 / 合集 / 关键词搜索
+  - DASH 纯音频 (AAC/m4s) 提取与 ffmpeg PCM 直推
+  - 超长音频 (>2h) 自动断点接力续播保护
+
+标准库零外部依赖 (Python 3.8+)。
+"""
+import os
+import sys
+import re
+import json
+import time
+import signal
+import subprocess
+import urllib.request
+import urllib.parse
+from functools import reduce
+from hashlib import md5
+
+SEARCH_CACHE = "/run/radiod/bilibili_search.cache"
+COOKIE_FILE = "/var/lib/radiod/bilibili_cookie"
+KEY_CACHE_FILE = "/tmp/bilibili_wbi_keys.json"
+
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+REFERER = "https://www.bilibili.com/"
+
+# 字符顺序打乱表 (Bilibili WBI 全站通用)
+MIXIN_KEY_ENC_TAB = [
+    46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49,
+    33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40,
+    61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11,
+    36, 20, 34, 44, 52
+]
+
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+def log(msg: str):
+    sys.stderr.write(f"bilibili-helper: {msg}\n")
+    sys.stderr.flush()
+
+
+def die(msg: str, code: int = 1):
+    log(f"错误: {msg}")
+    sys.exit(code)
+
+
+import html
+
+def clean_title(s: str) -> str:
+    """清洗标题中的 HTML 实体、标签、竖线、回车换行符，保护状态文件与显示。"""
+    if not s:
+        return "未知标题"
+    s = html.unescape(s)
+    s = re.sub(r"<[^>]+>", "", s)
+    s = s.replace("|", "／").replace("\r", " ").replace("\n", " ")
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def get_cookie() -> str:
+    """读取预留的可选 Cookie 文件，未配置时返回空字符串（纯匿名）。"""
+    if os.path.isfile(COOKIE_FILE):
+        try:
+            with open(COOKIE_FILE, "r", encoding="utf-8") as f:
+                c = f.read().strip()
+                if c:
+                    return c
+        except Exception:
+            pass
+    return ""
+
+
+def http_request(url: str, headers: dict = None, method: str = "GET", timeout: int = 8) -> bytes:
+    h = {
+        "User-Agent": USER_AGENT,
+        "Referer": REFERER,
+    }
+    c = get_cookie()
+    if c:
+        h["Cookie"] = c
+    if headers:
+        h.update(headers)
+    req = urllib.request.Request(url, headers=h, method=method)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def resolve_b23_shortlink(url: str) -> str:
+    """对 b23.tv 短链执行无跳转重定向捕获，直接从 302 Location 头获取真实 URL。"""
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    opener = urllib.request.build_opener(NoRedirect)
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with opener.open(req, timeout=5) as r:
+            return r.geturl()
+    except urllib.error.HTTPError as e:
+        if e.code in (301, 302, 303, 307, 308):
+            loc = e.headers.get("Location")
+            if loc:
+                return loc
+    except Exception as e:
+        log(f"解析短链失败: {e}")
+    return url
+
+
+def parse_video_input(raw: str) -> tuple[str, int]:
+    """
+    解析用户输入，兼容:
+      - 纯 BV 号 (BV1xx411c7mD)
+      - 纯 av 号 (av170001)
+      - b23.tv 短链 (https://b23.tv/xxx)
+      - 完整 Web 链接 (https://www.bilibili.com/video/BV.../?p=2)
+      - 手机 App 复制的长文本 (含前缀中文及短链)
+    返回: (bvid_or_avid, p_number)
+    """
+    raw = raw.strip().strip("'\"")
+    # 提取短链并重定向
+    m_b23 = re.search(r"https?://b23\.tv/[A-Za-z0-9]+", raw)
+    if m_b23:
+        raw = resolve_b23_shortlink(m_b23.group(0))
+
+    # 提取 P 分数 (如 ?p=2 或 &p=2)
+    p_num = 1
+    m_p = re.search(r"[?&]p=(\d+)", raw)
+    if m_p:
+        try:
+            p_num = max(1, int(m_p.group(1)))
+        except ValueError:
+            pass
+
+    # 提取 BV 号 (BV + 10位大小写字母数字)
+    m_bv = re.search(r"\b(BV[0-9A-Za-z]{10})\b", raw)
+    if m_bv:
+        return m_bv.group(1), p_num
+
+    # 提取 av 号 (av + 数字)
+    m_av = re.search(r"\bav(\d+)\b", raw, re.I)
+    if m_av:
+        return f"av{m_av.group(1)}", p_num
+
+    return raw, p_num
+
+
+def get_mixin_key(orig: str) -> str:
+    return reduce(lambda s, i: s + orig[i], MIXIN_KEY_ENC_TAB, "")[:32]
+
+
+def get_wbi_keys() -> tuple[str, str]:
+    """获取 WBI 鉴权密钥 (带本地 6 小时文件缓存，失效自动重刷)。"""
+    now = time.time()
+    if os.path.isfile(KEY_CACHE_FILE):
+        try:
+            with open(KEY_CACHE_FILE, "r", encoding="utf-8") as f:
+                d = json.load(f)
+                if now - d.get("ts", 0) < 21600:
+                    return d["img_key"], d["sub_key"]
+        except Exception:
+            pass
+
+    try:
+        body = http_request("https://api.bilibili.com/x/web-interface/nav", timeout=6)
+        data = json.loads(body.decode("utf-8"))
+        wbi_img = data["data"]["wbi_img"]
+        img_key = wbi_img["img_url"].rsplit("/", 1)[1].split(".")[0]
+        sub_key = wbi_img["sub_url"].rsplit("/", 1)[1].split(".")[0]
+        with open(KEY_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"img_key": img_key, "sub_key": sub_key, "ts": now}, f)
+        return img_key, sub_key
+    except Exception as e:
+        log(f"获取 WBI 密钥失败: {e}，使用兜底密钥")
+        return "7cd084941338484a827105e25f68485c", "4932caff0ff746eab6f01bf08b70ac45"
+
+
+def enc_wbi(params: dict, img_key: str, sub_key: str) -> dict:
+    mixin_key = get_mixin_key(img_key + sub_key)
+    params["wts"] = round(time.time())
+    params = dict(sorted(params.items()))
+    params = {k: "".join(filter(lambda c: c not in "!'()*", str(v))) for k, v in params.items()}
+    query = urllib.parse.urlencode(params)
+    wbi_sign = md5((query + mixin_key).encode("utf-8")).hexdigest()
+    params["w_rid"] = wbi_sign
+    return params
+
+
+def get_pagelist(bvid: str) -> list[dict]:
+    """通过 x/player/pagelist 提取分 P 信息与 cid (完全不受 412 限制)。"""
+    url = f"https://api.bilibili.com/x/player/pagelist?bvid={bvid}"
+    body = http_request(url, timeout=6)
+    data = json.loads(body.decode("utf-8"))
+    if data.get("code") != 0:
+        die(f"获取视频分P失败: {data.get('message')} (bvid={bvid})", 22)
+    return data.get("data", [])
+
+
+def is_bad_cdn(url: str) -> bool:
+    """判断是否为易断连的 PCDN / MCDN / 边缘节点。"""
+    if not url:
+        return True
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.netloc.lower()
+    if "mcdn" in host or "pcdn" in host or "szbdyd" in host:
+        return True
+    if ":" in host and not host.endswith(":443") and not host.endswith(":80"):
+        return True
+    if "os=mcdn" in parsed.query:
+        return True
+    return False
+
+
+def get_playurl(bvid: str, cid: int) -> tuple[str, int, int]:
+    """提取 DASH 纯音频 CDN URL 与有效时长、音频总时长(秒)。"""
+    img_key, sub_key = get_wbi_keys()
+    params = {
+        "bvid": bvid,
+        "cid": cid,
+        "fnval": 16,   # DASH 协议
+        "fnver": 0,
+        "fourk": 1
+    }
+    signed_p = enc_wbi(params, img_key, sub_key)
+    url = "https://api.bilibili.com/x/player/wbi/playurl?" + urllib.parse.urlencode(signed_p)
+    body = http_request(url, timeout=8)
+    data = json.loads(body.decode("utf-8"))
+
+    if data.get("code") != 0:
+        # 若报签名错误，强制刷新密钥重试一次
+        if os.path.isfile(KEY_CACHE_FILE):
+            os.remove(KEY_CACHE_FILE)
+        img_key, sub_key = get_wbi_keys()
+        signed_p = enc_wbi(params, img_key, sub_key)
+        url = "https://api.bilibili.com/x/player/wbi/playurl?" + urllib.parse.urlencode(signed_p)
+        body = http_request(url, timeout=8)
+        data = json.loads(body.decode("utf-8"))
+
+    if data.get("code") != 0:
+        die(f"获取播放地址失败: {data.get('message')} (code={data.get('code')})", 22)
+
+    play_data = data.get("data", {})
+    dash = play_data.get("dash")
+    if not dash or not dash.get("audio"):
+        die("该视频无可用 DASH 音频轨道", 22)
+
+    # 优先选取码率最高或可用的音频轨道
+    audios = dash["audio"]
+    # 按 bandwidth 降序排序
+    audios.sort(key=lambda a: a.get("bandwidth", 0), reverse=True)
+    best_audio = audios[0]
+
+    # 核心优化: 优先选取官方优质骨干 UPOS CDN，主动避开容易断流超时的 PCDN/MCDN
+    candidates = []
+    if best_audio.get("baseUrl"):
+        candidates.append(best_audio["baseUrl"])
+    candidates.extend(best_audio.get("backupUrl") or [])
+
+    audio_url = ""
+    for c in candidates:
+        if not is_bad_cdn(c):
+            audio_url = c
+            break
+    if not audio_url and candidates:
+        audio_url = candidates[0]
+
+    if not audio_url:
+        die("无法获取音频流直链", 22)
+
+    # 提取总音频时长 (毫秒转秒)
+    duration_sec = int(play_data.get("timelength", 0)) // 1000
+
+    # 从 URL 中提取 deadline 或默认 7200 秒
+    deadline_sec = 7200
+    try:
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(audio_url).query)
+        if "deadline" in qs:
+            deadline_sec = max(300, int(qs["deadline"][0]) - int(time.time()))
+    except Exception:
+        pass
+
+    return audio_url, deadline_sec, duration_sec
+
+
+# ── CLI 子命令实现 ─────────────────────────────────────────────────────────
+
+def cmd_list_video(args: list[str]):
+    if not args:
+        die("用法: bilibili-helper list video <BV号/链接/文案> [p序号]", 24)
+    raw = args[0]
+    spec_p = int(args[1]) if len(args) > 1 and args[1].isdigit() else None
+
+    bvid, p_num = parse_video_input(raw)
+    if spec_p is not None:
+        p_num = spec_p
+
+    pages = get_pagelist(bvid)
+    if not pages:
+        die(f"视频无分P内容: {bvid}", 22)
+
+    # 如果只有 1 P 或者指定了具体 P，只输出单条
+    if len(pages) == 1:
+        p = pages[0]
+        title = clean_title(p.get("part") or bvid)
+        print(f"{bvid}:{p['cid']} {title}")
+    elif spec_p is not None:
+        idx = max(0, min(len(pages) - 1, p_num - 1))
+        p = pages[idx]
+        title = clean_title(f"P{idx+1} {p.get('part') or bvid}")
+        print(f"{bvid}:{p['cid']} {title}")
+    else:
+        # 多 P 且未指定具体 P：输出全部 P 作为歌单
+        for i, p in enumerate(pages):
+            title = clean_title(f"P{i+1} {p.get('part') or bvid}")
+            print(f"{bvid}:{p['cid']} {title}")
+
+
+def cmd_list_fav(args: list[str]):
+    if not args:
+        die("用法: bilibili-helper list fav <收藏夹ID或链接>", 24)
+    raw = args[0].strip().strip("'\"")
+    m_fid = re.search(r"(?:fid=|media_id=|ml|favorites/)(\d+)", raw)
+    if m_fid:
+        fid = m_fid.group(1)
+    else:
+        m_num = re.search(r"\b(\d+)\b", raw)
+        if m_num:
+            fid = m_num.group(1)
+        else:
+            die(f"无法识别收藏夹 ID: {raw}", 24)
+
+    all_medias = []
+    pn = 1
+    while True:
+        url = f"https://api.bilibili.com/x/v3/fav/resource/list?media_id={fid}&pn={pn}&ps=40"
+        body = http_request(url, timeout=8)
+        data = json.loads(body.decode("utf-8"))
+        if data.get("code") != 0:
+            if pn == 1:
+                die(f"读取收藏夹失败: {data.get('message')} (fid={fid})", 22)
+            break
+
+        medias = data.get("data", {}).get("medias", [])
+        if not medias:
+            if pn == 1:
+                die("收藏夹为空或为私密收藏夹 (私密收藏夹需在 Cookie 文件中配置 SESSDATA)", 22)
+            break
+
+        all_medias.extend(medias)
+        has_more = data.get("data", {}).get("has_more", False)
+        if not has_more or len(medias) < 40 or pn >= 25:
+            break
+        pn += 1
+
+    for item in all_medias:
+        bvid = item.get("bvid")
+        title = clean_title(item.get("title"))
+        # 收藏夹视频通过 bvid 取默认 cid
+        print(f"{bvid} {title}")
+
+
+def cmd_list_season(args: list[str]):
+    if not args:
+        die("用法: bilibili-helper list season <合集ID或链接> [mid]", 24)
+    raw = args[0].strip().strip("'\"")
+
+    # 提取 mid (若有)
+    mid = args[1].strip().strip("'\"") if len(args) > 1 and args[1].strip().strip("'\"").isdigit() else "0"
+    if mid == "0":
+        m_mid = re.search(r"space\.bilibili\.com/(\d+)", raw)
+        if m_mid:
+            mid = m_mid.group(1)
+
+    # 提取 season_id / series_id
+    m_sid = re.search(r"(?:season_id=|sid=|series_id=|series/)(\d+)", raw)
+    if m_sid:
+        season_id = m_sid.group(1)
+    else:
+        # 没有显式 key 时，提取数字，注意避开 mid
+        nums = re.findall(r"\b(\d+)\b", raw)
+        candidates = [n for n in nums if n != mid]
+        if candidates:
+            season_id = candidates[0]
+        elif nums:
+            season_id = nums[0]
+        else:
+            die(f"无法识别合集 ID: {raw}", 24)
+
+    all_archives = []
+    # 策略 1: 尝试合集接口 seasons_archives_list (支持分页取全)
+    page = 1
+    while True:
+        url = f"https://api.bilibili.com/x/polymer/web-space/seasons_archives_list?mid={mid}&season_id={season_id}&page_num={page}&page_size=40"
+        try:
+            body = http_request(url, timeout=8)
+            data = json.loads(body.decode("utf-8"))
+        except Exception as e:
+            if page == 1:
+                log(f"seasons_archives_list 请求异常: {e}")
+            break
+
+        if data.get("code") != 0:
+            break
+
+        archives = data.get("data", {}).get("archives", [])
+        if not archives:
+            break
+
+        all_archives.extend(archives)
+        total = data.get("data", {}).get("page", {}).get("total", 0)
+        if len(all_archives) >= total or len(archives) < 40 or page >= 25:
+            break
+        page += 1
+
+    # 策略 2: 若合集接口无数据，尝试系列接口 series/archives (支持分页取全)
+    if not all_archives:
+        page = 1
+        while True:
+            url = f"https://api.bilibili.com/x/series/archives?mid={mid}&series_id={season_id}&only_normal=true&sort=asc&pn={page}&ps=40"
+            try:
+                body = http_request(url, timeout=8)
+                data = json.loads(body.decode("utf-8"))
+            except Exception as e:
+                if page == 1:
+                    log(f"series/archives 请求异常: {e}")
+                break
+
+            if data.get("code") != 0:
+                break
+
+            archives = data.get("data", {}).get("archives", [])
+            if not archives:
+                break
+
+            all_archives.extend(archives)
+            total = data.get("data", {}).get("page", {}).get("total", 0)
+            if len(all_archives) >= total or len(archives) < 40 or page >= 25:
+                break
+            page += 1
+
+    if not all_archives:
+        die(f"合集为空或不存在 (season_id={season_id}, mid={mid})", 22)
+
+    for arc in all_archives:
+        bvid = arc.get("bvid")
+        title = clean_title(arc.get("title"))
+        print(f"{bvid} {title}")
+
+
+def cmd_search(args: list[str]):
+    if not args:
+        die("用法: bilibili-helper search <关键词>", 24)
+    kw = " ".join(args).strip()
+
+    img_key, sub_key = get_wbi_keys()
+    signed_p = enc_wbi({"keyword": kw}, img_key, sub_key)
+    url = "https://api.bilibili.com/x/web-interface/wbi/search/all/v2?" + urllib.parse.urlencode(signed_p)
+
+    try:
+        body = http_request(url, timeout=8)
+        data = json.loads(body.decode("utf-8"))
+    except Exception as e:
+        die(f"搜索请求异常: {e}", 23)
+
+    if data.get("code") != 0:
+        die(f"搜索接口返回错误: {data.get('message')} (code={data.get('code')})", 23)
+
+    v_list = []
+    for r in data.get("data", {}).get("result", []):
+        if r.get("result_type") == "video":
+            v_list = r.get("data", [])
+            break
+
+    if not v_list:
+        die(f"未找到关于 '{kw}' 的视频", 22)
+
+    print(f"B站视频搜索结果 (共 {len(v_list)} 条):")
+    cache_lines = []
+    for i, v in enumerate(v_list[:20], 1):
+        bvid = v.get("bvid")
+        title = clean_title(v.get("title"))
+        author = v.get("author", "未知UP")
+        dur = v.get("duration", "--:--")
+        print(f"{i:3d}. {title} — {author} ({dur})")
+        cache_lines.append(f"{bvid} {title}\n")
+
+    # 写入缓存文件 (支持跨文件系统拷贝并设为 666 权限)
+    import shutil
+    tmp_path = f"/tmp/bili-search.{os.getpid()}"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.writelines(cache_lines)
+        os.chmod(tmp_path, 0o666)
+        shutil.copyfile(tmp_path, SEARCH_CACHE)
+        try:
+            os.chmod(SEARCH_CACHE, 0o666)
+        except OSError:
+            pass
+        os.remove(tmp_path)
+        print("播放: radioctl bilibili play <序号> (从 1 起)")
+    except Exception as e:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        log(f"警告: 搜索缓存写入失败: {e}")
+
+
+def cmd_list_search_cache():
+    if not os.path.isfile(SEARCH_CACHE):
+        die("搜索缓存不存在, 请先执行 radioctl bilibili search <关键词>", 24)
+    with open(SEARCH_CACHE, "r", encoding="utf-8") as f:
+        sys.stdout.write(f.read())
+
+
+def cmd_stream(args: list[str]):
+    if not args:
+        die("用法: bilibili-helper stream <bvid[:cid]> [target_fifo] [start_time]", 24)
+    target = args[0].strip().strip("'\"")
+    fifo = args[1].strip().strip("'\"") if len(args) > 1 else "/run/radiod/audio.fifo"
+    ss = args[2].strip().strip("'\"") if len(args) > 2 else ""
+
+    # 解析 target
+    if ":" in target:
+        bvid, cid_str = target.split(":", 1)
+        cid = int(cid_str) if cid_str.isdigit() else 0
+    else:
+        bvid, _ = parse_video_input(target)
+        cid = 0
+
+    # 若未指定具体 cid，查一次 pagelist
+    if not cid:
+        pages = get_pagelist(bvid)
+        if not pages:
+            die(f"未能获取视频分P: {bvid}", 22)
+        cid = pages[0]["cid"]
+
+    audio_url, deadline_sec, total_duration = get_playurl(bvid, cid)
+    hdr = f"Referer: {REFERER}\r\nUser-Agent: {USER_AGENT}\r\n"
+
+    # 解析起始偏移秒数
+    start_sec = 0
+    if ss:
+        parts = ss.split(":")
+        try:
+            if len(parts) == 1:
+                start_sec = float(parts[0])
+            elif len(parts) == 2:
+                start_sec = int(parts[0]) * 60 + float(parts[1])
+            elif len(parts) == 3:
+                start_sec = int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+        except ValueError:
+            start_sec = 0
+
+    # 常规曲目 (<= 7000s ≈ 1.94h): 直接 exec ffmpeg，0 进程监管开销，完美保持 PID
+    # 增加 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 保证 HTTP 抖动不断播
+    if 0 < total_duration <= 7000 and deadline_sec > 600:
+        cmd = [
+            "ffmpeg",
+            "-hide_banner", "-loglevel", "warning", "-nostdin", "-y",
+            "-rw_timeout", "15000000",
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "5",
+            "-headers", hdr,
+        ]
+        if ss:
+            cmd.extend(["-ss", ss])
+        cmd.extend([
+            "-i", audio_url,
+            "-vn", "-map", "0:a:0",
+            "-ac", "2", "-ar", "44100", "-f", "s16le",
+            fifo
+        ])
+        os.execvp("ffmpeg", cmd)
+
+    # 超长音频 (>2h 或未知时长): 启动 Supervisor 监听，断连自动带 -ss 秒级续播
+    log(f"启动超长音频断点接力守护 (duration={total_duration}s, token_valid={deadline_sec}s, start_offset={start_sec}s)")
+    current_offset = int(start_sec)
+
+    while True:
+        cmd = [
+            "ffmpeg",
+            "-hide_banner", "-loglevel", "warning", "-nostdin", "-y",
+            "-rw_timeout", "15000000",
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "5",
+            "-headers", hdr,
+        ]
+        if current_offset > 0:
+            cmd.extend(["-ss", str(current_offset)])
+        cmd.extend([
+            "-i", audio_url,
+            "-vn", "-map", "0:a:0",
+            "-ac", "2", "-ar", "44100", "-f", "s16le",
+            fifo
+        ])
+
+        start_ts = time.time()
+        proc = subprocess.Popen(cmd)
+
+        def handle_signal(sig, frame):
+            proc.terminate()
+            sys.exit(0)
+
+        signal.signal(signal.SIGTERM, handle_signal)
+        signal.signal(signal.SIGINT, handle_signal)
+
+        ret = proc.wait()
+        elapsed = time.time() - start_ts
+        current_offset += int(elapsed)
+
+        # 正常播放完毕判定: 达到总时长末尾 或 (未知时长且正常退出)
+        if (total_duration > 0 and current_offset >= total_duration - 5) or (total_duration == 0 and ret == 0):
+            sys.exit(0)
+
+        # 运行少于 3 秒崩溃，判定为无法继续播放，避免快速死循环
+        if elapsed < 3:
+            log(f"上游持续失败 (已播 {current_offset}s, 退出码 {ret}), 停止接力")
+            sys.exit(ret if ret != 0 else 22)
+
+        # 非正常中断且未播完，申请新 Token 接力续播
+        log(f"上游连接中断于 {current_offset}s (目标总长 {total_duration}s)，正在申请新 Token 断点接力...")
+        try:
+            audio_url, _, _ = get_playurl(bvid, cid)
+            time.sleep(0.3)
+        except Exception as e:
+            log(f"接力续播换链失败: {e}")
+            sys.exit(ret if ret != 0 else 22)
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("bilibili-helper — Bilibili 音源辅助工具")
+        print("用法:")
+        print("  bilibili-helper list video <BV号/链接> [p]   列出单视频或分P")
+        print("  bilibili-helper list fav <收藏夹ID/链接>      列出公开收藏夹")
+        print("  bilibili-helper list season <合集ID/链接>     列出UP主合集")
+        print("  bilibili-helper list search-cache             输出上次搜索缓存")
+        print("  bilibili-helper search <关键词...>            搜索单曲视频")
+        print("  bilibili-helper stream <bvid[:cid]> [fifo]    提取音频推流至 FIFO")
+        sys.exit(0)
+
+    sub = sys.argv[1]
+    args = sys.argv[2:]
+
+    if sub == "list":
+        if not args:
+            die("list 需要子参数: video | fav | season | search-cache", 24)
+        target = args[0]
+        if target == "video":
+            cmd_list_video(args[1:])
+        elif target == "fav":
+            cmd_list_fav(args[1:])
+        elif target == "season":
+            cmd_list_season(args[1:])
+        elif target in ("search-cache", "search"):
+            cmd_list_search_cache()
+        else:
+            die(f"未知的 list 类别: {target}", 24)
+    elif sub == "search":
+        cmd_search(args)
+    elif sub == "stream":
+        cmd_stream(args)
+    else:
+        die(f"未知命令: {sub}", 24)
+
+
+if __name__ == "__main__":
+    main()

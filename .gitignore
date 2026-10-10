@@ -1,0 +1,20 @@
+# Python bytecode and cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Sync and scrapers cache
+.vps-sync/
+.firecrawl/
+.claude/
+
+# Media audio files (test tracks)
+media/*
+!media/.gitkeep
+
+# Temporary / OS files
+*.tmp
+*.bak
+*.log
+.DS_Store
+Thumbs.db

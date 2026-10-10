@@ -1,0 +1,444 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>JAM · 在线电台</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; min-height: 100%;
+    background: #12101a;
+    color: #e8e4f0;
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .wrap { text-align: center; padding: 40px 24px; max-width: 480px; width: 100%; }
+  .orb {
+    width: 148px; height: 148px; margin: 0 auto 30px;
+    border-radius: 50%;
+    background: radial-gradient(circle at 30% 30%, #8a63d2, #53288f 60%, #3a1c63);
+    box-shadow: 0 0 60px rgba(138, 99, 210, .45), inset 0 0 24px rgba(0,0,0,.4);
+    cursor: pointer; position: relative; transition: transform .15s ease, box-shadow .3s ease;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .orb:hover { transform: scale(1.04); }
+  .orb.playing { animation: pulse 2.4s ease-in-out infinite; }
+  @keyframes pulse {
+    0%, 100% { box-shadow: 0 0 60px rgba(138,99,210,.45), inset 0 0 24px rgba(0,0,0,.4); }
+    50%      { box-shadow: 0 0 96px rgba(138,99,210,.75), inset 0 0 24px rgba(0,0,0,.4); }
+  }
+  .orb .tri {
+    width: 0; height: 0; border-left: 34px solid rgba(255,255,255,.92);
+    border-top: 21px solid transparent; border-bottom: 21px solid transparent;
+    margin-left: 10px; transition: opacity .2s;
+  }
+  .orb.playing .tri { opacity: 0; }
+  .orb .bars { position: absolute; display: none; gap: 5px; align-items: center; height: 44px; }
+  .orb.playing .bars { display: flex; }
+  .bars span {
+    width: 6px; border-radius: 3px; background: rgba(255,255,255,.92);
+    animation: eq 1s ease-in-out infinite;
+  }
+  .bars span:nth-child(1) { height: 16px; animation-delay: 0s; }
+  .bars span:nth-child(2) { height: 34px; animation-delay: .18s; }
+  .bars span:nth-child(3) { height: 24px; animation-delay: .36s; }
+  .bars span:nth-child(4) { height: 40px; animation-delay: .1s; }
+  .bars span:nth-child(5) { height: 20px; animation-delay: .28s; }
+  @keyframes eq { 0%,100% { transform: scaleY(.55); } 50% { transform: scaleY(1); } }
+  h1 { font-size: 22px; font-weight: 600; letter-spacing: .12em; margin: 0 0 6px; }
+  .sub { color: #9a8fb8; font-size: 13px; margin-bottom: 26px; }
+  #state { font-size: 13px; color: #8d84a8; min-height: 20px; margin-top: 22px; }
+  #state.err { color: #e8a1a1; }
+  .np { margin-top: 26px; min-height: 44px; }
+  .np .src { font-size: 11px; color: #7a6f9c; letter-spacing: .2em; text-transform: uppercase; }
+  .np .track { font-size: 15px; color: #cfc6e4; margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .np .track b { color: #e8e4f0; font-weight: 500; }
+  .listeners { margin-top: 18px; font-size: 12px; color: #6a6080; min-height: 18px; transition: color .4s; }
+  .listeners.active { color: #8a6dbf; }
+  audio { display: none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="orb" id="orb" title="播放 / 暂停">
+    <div class="tri"></div>
+    <div class="bars"><span></span><span></span><span></span><span></span><span></span></div>
+  </div>
+  <h1>JAM</h1>
+  <div id="state">点上面开始收听</div>
+  <div class="np">
+    <div class="src" id="npSrc"></div>
+    <div class="track" id="npTrack"></div>
+  </div>
+  <div class="listeners" id="listenersEl"></div>
+  <audio id="hlsAudio" controls></audio>
+</div>
+
+<script src="/hls.js"></script>
+<script>
+"use strict";
+const orb = document.getElementById("orb");
+const stateEl = document.getElementById("state");
+const audio = document.getElementById("hlsAudio");
+const npSrc = document.getElementById("npSrc");
+const npTrack = document.getElementById("npTrack");
+
+// 主备顺序 (2026-09-14 反转): HLS 主路 (TCP, 丢包自动重传, 不缺块), WebRTC 备路 (低延迟但怕丢包)。
+// 起因: 跨境 UDP 丢包 → 浏览器 NetEQ 时域拉伸追帧 → 听感忽快忽慢/变调; 稳定优先于延迟。
+// ?src=webrtc → 恢复旧版顺序 (WebRTC 主路, HLS 兜底), 排障对比/想听低延迟时用
+const WEBRTC_FIRST = new URLSearchParams(location.search).get("src") === "webrtc";
+
+let mode = null;          // "webrtc" | "hls" | null
+let whepReader = null;    // RTCPeerConnection (webrtc 模式)
+let hls = null;           // hls.js 实例 (hls 模式)
+let hlsFails = 0;         // HLS 启动失败计数 (≥2 → 换路)
+let webrtcFails = 0;      // WebRTC 启动失败计数 (≥2 → 换路/慢循环)
+let waitTimes = [];       // waiting 事件时间戳 (播中劣化判定, 窗口随主路不同)
+let manualPause = false;
+let started = false;       // 出过声 (playing 事件置位): 区分"启动中"与"播着", 防启动期点击被误判为暂停
+let hlsDegraded = false;  // HLS 播中劣化过 → WebRTC 全败后也不再回切 HLS (防乒乓)
+let hlsPlayTimer = null;  // HLS 启动 8s 无 playing 判失败
+
+function setState(text, isErr) {
+  stateEl.textContent = text;
+  stateEl.className = isErr ? "err" : "";
+}
+function setPlaying(on) {
+  orb.classList.toggle("playing", on);
+}
+function modeText() {
+  if (mode === "hls") return WEBRTC_FIRST ? "HLS 直播" : "HLS · 稳定直播";
+  if (mode === "webrtc") return WEBRTC_FIRST ? "WebRTC · 低延迟直播" : "WebRTC · 低延迟备路";
+  return "连接中…";
+}
+function startPrimary() {
+  if (WEBRTC_FIRST) startWebRTC(); else startHLS();
+}
+
+// ---------- WebRTC / WHEP (备路; ?src=webrtc 时为主路) ----------
+// 信令流程照 mediamtx 内建 reader: POST /whep (offer SDP) → answer SDP + ICE server link 头
+// candidate 用 POST <session>?... 补发。audio-only transceiver。
+async function whepStart() {
+  const pc = new RTCPeerConnection({ iceServers: [] });
+  let sessionUrl = null;
+  const pending = [];
+
+  pc.addTransceiver("audio", { direction: "recvonly" });
+  pc.ontrack = (ev) => {
+    // 抗抖动: 目标缓冲 1s (Chrome 112+; Safari/Firefox 无此属性自动跳过)。
+    // 默认 NetEQ 贴地飞行, 抖动一大就时域拉伸追帧 (忽快忽慢/变调), 音乐流受害最深
+    if (ev.receiver && ev.receiver.jitterBufferTarget !== undefined) {
+      try { ev.receiver.jitterBufferTarget = 1000; } catch {}
+    }
+    audio.srcObject = ev.streams[0];
+    audio.play().catch(() => {
+      // 手势过期时兜底: 数据就绪后自动播 (与 HLS 分支同思路)
+      audio.addEventListener("canplay", () => { if (!manualPause) audio.play().catch(() => {}); }, { once: true });
+    });
+  };
+  // 断线自愈: failed 后页面自动重建会话, 不需要手动刷新
+  pc.onconnectionstatechange = () => {
+    if (pc.connectionState === "failed" && mode === "webrtc" && !manualPause) {
+      try { pc.close(); } catch {}
+      if (whepReader === pc) whepReader = null;
+      setState("连接断开, 重连中…", true);
+      startWebRTC();
+    }
+  };
+  pc.onicecandidate = (ev) => {
+    if (ev.candidate && sessionUrl) {
+      fetch(sessionUrl + "?session=" + encodeURIComponent(sessionUrl.split("/").pop()), {
+        method: "POST",
+        headers: { "Content-Type": "application/trickle-ice-sdpfragment" },
+        body: candToSDP(ev.candidate),
+      }).catch(() => {});
+    } else if (ev.candidate) {
+      pending.push(ev.candidate);
+    }
+  };
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+
+  const res = await fetch("/whep", {
+    method: "POST",
+    headers: { "Content-Type": "application/sdp" },
+    body: offer.sdp,
+  });
+  if (!res.ok) throw new Error("WHEP " + res.status);
+  sessionUrl = res.headers.get("Location")
+    ? new URL(res.headers.get("Location"), location.href).href
+    : null;
+
+  const answer = await res.text();
+  await pc.setRemoteDescription({ type: "answer", sdp: answer });
+
+  for (const c of pending) {
+    if (sessionUrl) {
+      fetch(sessionUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/trickle-ice-sdpfragment" },
+        body: candToSDP(c),
+      }).catch(() => {});
+    }
+  }
+  return pc;
+}
+
+function candToSDP(cand) {
+  const c = cand.candidate || "";
+  return "a=" + c + "\r\n";
+}
+
+async function startWebRTC(reason) {
+  setState("连接中…");
+  // 双向清理: 从 HLS 切来时拆掉 hls.js / 原生 src
+  if (hls) { try { hls.destroy(); } catch {} hls = null; }
+  audio.removeEventListener("error", onHlsErr);
+  if (audio.src) { audio.removeAttribute("src"); audio.load(); }
+  clearTimeout(hlsPlayTimer);
+  try {
+    whepReader = await whepStart();
+    mode = "webrtc";
+    webrtcFails = 0;
+    waitTimes = [];
+    setPlaying(true);
+    setState((reason ? reason + " · " : "") + modeText());
+    // ICE 失败检测: 5s 内没有 track 就降级
+    setTimeout(() => {
+      if (mode === "webrtc" && !audio.srcObject) failWebRTC();
+    }, 5000);
+  } catch (e) {
+    failWebRTC(e);
+  }
+}
+
+function failWebRTC(e) {
+  webrtcFails++;
+  if (whepReader) { try { whepReader.close(); } catch {} whepReader = null; }
+  mode = null;
+  if (webrtcFails >= 2) {
+    if (WEBRTC_FIRST) {
+      startHLS("WebRTC 不通");            // 旧版行为: HLS 兜底
+    } else if (hlsDegraded) {
+      // HLS 本会话已证明不稳 (waiting 风暴降级过), 不回切; 慢循环重试 WebRTC, 刷新页面可重来
+      setState("网络不佳, 10 秒后重试…", true);
+      setTimeout(startWebRTC, 10000);
+    } else {
+      // 两路启动都不通: 10s 慢循环回 HLS (防两路乒乓)
+      setState("网络不佳, 10 秒后重试…", true);
+      setTimeout(startHLS, 10000);
+    }
+  } else {
+    setState("WebRTC 重试…", true);
+    setTimeout(startWebRTC, 1500);
+  }
+}
+
+// ---------- HLS (主路; ?src=webrtc 时为备路) ----------
+function onHlsErr() { if (mode === "hls") failHLS(); }
+
+function startHLS(reason) {
+  if (mode === "hls") { audio.play().catch(() => {}); return; }
+  // 双向清理: 从 WebRTC 切来时拆掉 pc
+  if (whepReader) { try { whepReader.close(); } catch {} whepReader = null; }
+  mode = "hls";
+  waitTimes = [];
+  setState("连接中…"); setPlaying(true);    // 即时反馈: 光球动起来, 不再让用户怀疑没点上
+  if (audio.canPlayType("application/vnd.apple.mpegurl")) {
+    // Safari/iOS 原生 HLS
+    audio.srcObject = null;
+    audio.src = "/hls/live/index.m3u8";
+    audio.removeEventListener("error", onHlsErr);
+    audio.addEventListener("error", onHlsErr, { once: true });
+  } else if (window.Hls && Hls.isSupported()) {
+    if (hls) { try { hls.destroy(); } catch {} hls = null; }
+    // 稳定优先: 关 LL 边缘追逐 (贴边是卡顿主因), 落后 3 段 (1s 段长) ≈ 3-4.5s 延迟
+    hls = new Hls({ lowLatencyMode: false, liveSyncDurationCount: 3, backBufferLength: 30 });
+    hls.attachMedia(audio);
+    hls.loadSource("/hls/live/index.m3u8");
+    hls.on(Hls.Events.ERROR, (_, d) => { if (d.fatal) failHLS(); });
+  } else {
+    mode = null;
+    startWebRTC("浏览器无 HLS 支持");      // 极老浏览器: 直接走 WebRTC
+    return;
+  }
+  audio.srcObject = null;
+  // 一次性 canplay: hls.js 数据到达后自动补播 (启动期 audio.play() 常因数据未就绪
+  // 被拒, 之前只靠用户再点一次救回 → "按 3 次才响" 的第二层根因)
+  audio.addEventListener(
+    "canplay",
+    () => { if (mode === "hls" && !manualPause) audio.play().catch(() => {}); },
+    { once: true }
+  );
+  audio.play().catch(() => {});   // 尽力先试: Safari 原生分支通常直接成; hls.js 分支由 canplay 兜底
+  // 启动超时: 8s 内没 playing 判失败 (正常 1-2s 即响); 手动暂停期间不计数
+  clearTimeout(hlsPlayTimer);
+  hlsPlayTimer = setTimeout(() => { if (mode === "hls" && !manualPause) failHLS(); }, 8000);
+}
+
+function failHLS() {
+  hlsFails++;
+  if (hls) { try { hls.destroy(); } catch {} hls = null; }
+  if (audio.src) { audio.removeAttribute("src"); audio.load(); }
+  mode = null;
+  if (hlsFails >= 2) {
+    if (WEBRTC_FIRST) {
+      // 旧版顺序下两路都不通: 慢循环
+      setState("网络不佳, 10 秒后重试…", true);
+      setTimeout(startWebRTC, 10000);
+    } else {
+      startWebRTC("HLS 不通");
+    }
+  } else {
+    setState("HLS 重试…", true);
+    setTimeout(startHLS, 1500);
+  }
+}
+
+// ---------- 控件 ----------
+orb.addEventListener("click", async () => {
+  // 启动期 (点过但还没出声) 的点击不当暂停: 帮一把 play (play() 在 hls.js 数据到达前调用
+  // 会静默 reject, 这是"要按 3 次"的根因: ①play 太早 ②被误判暂停 ③数据已就绪才成功)
+  if (mode && !started) {
+    audio.play().catch(() => {});
+    setState("连接中…");
+    return;
+  }
+  if (manualPause) {
+    manualPause = false;
+    audio.play().catch(() => {});
+    setPlaying(true);
+    setState(mode ? modeText() : "连接中…");
+    if (!mode) startPrimary();
+    return;
+  }
+  if (mode) {
+    // 暂停: 只停 audio, 会话保留 (恢复快)
+    audio.pause(); manualPause = true; setPlaying(false); setState("已暂停");
+    return;
+  }
+  startPrimary();
+});
+audio.volume = 1;   // 页面内音量轴已删, 音量交给系统/设备
+
+audio.addEventListener("playing", () => {
+  started = true;                       // 出声即算启动完成; 之后的点击才是"暂停"
+  setPlaying(true);
+  clearTimeout(hlsPlayTimer);           // HLS 启动成功, 撤掉 8s 超时
+  if (mode === "hls") { hlsFails = 0; setState(modeText()); }
+  else if (mode === "webrtc") webrtcFails = 0;
+});
+audio.addEventListener("waiting", () => {
+  if (manualPause || !mode) return;
+  const now = Date.now();
+  if (mode === "hls") {
+    // HLS 主路: 单次卡顿 hls.js 自愈 (20 段窗口), 不切; 60s 内 ≥4 次风暴才换 WebRTC。
+    // ?src=webrtc 旧序下 HLS 是终态兜底 (WebRTC 已败过两次), 不回切防乒乓
+    if (!WEBRTC_FIRST) {
+      waitTimes = waitTimes.filter((t) => now - t < 60000);
+      waitTimes.push(now);
+      if (waitTimes.length >= 4) {
+        waitTimes = [];
+        hlsDegraded = true;
+        startWebRTC("HLS 连接不稳");
+      } else setState("缓冲中…");
+    } else setState("缓冲中…");
+  } else {
+    // WebRTC: 旧序主路 30s ≥3 次 → 切 HLS; 新序备路为终态 (hlsDegraded 已封回切), 只提示
+    if (WEBRTC_FIRST) {
+      waitTimes = waitTimes.filter((t) => now - t < 30000);
+      waitTimes.push(now);
+      if (waitTimes.length >= 3) {
+        waitTimes = [];
+        startHLS("WebRTC 劣化");
+      } else setState("缓冲中…");
+    } else setState("网络波动…");
+  }
+});
+
+// 页面重新可见时恢复播放
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && !manualPause && mode) audio.play().catch(() => {});
+});
+
+// ---------- Now Playing (公开只读端点 /np, 12s 轮询) ----------
+// 音源名 + 曲目。spotify 源时服务端拿不到曲目 (librespot 不上报), 显示引导文案
+const SRC_NAMES = { spotify: "Spotify", file: "本地文件", folder: "媒体库", netease: "网易云", soundcloud: "SoundCloud" };
+const CTX_NAMES = { "playlist:": "歌单", "album:": "专辑", fm: "私人 FM", daily: "每日推荐", search: "搜索点歌", "likes:": "Likes" };
+const SC_CTX_NAMES = { "playlist:": "歌单", search: "搜索点歌" };
+
+// 在线人数显示
+const listenersEl = document.getElementById("listenersEl");
+function renderListeners(n) {
+  if (typeof n !== "number" || n < 1) {
+    listenersEl.textContent = "";
+    listenersEl.className = "listeners";
+  } else {
+    listenersEl.textContent = n === 1 ? "1 人在听" : `${n} 人在听`;
+    listenersEl.className = "listeners active";
+  }
+}
+
+// 客户端唯一 ID: 持久化到 localStorage, 让服务端统计活跃人数
+function getClientId() {
+  const KEY = "jam_cid";
+  let id = localStorage.getItem(KEY);
+  if (!id) {
+    // crypto.randomUUID 若不可用 (老浏览器) 则退而用 Math.random
+    id = (crypto.randomUUID ? crypto.randomUUID()
+      : Array.from(crypto.getRandomValues(new Uint8Array(16)))
+          .map(b => b.toString(16).padStart(2, "0")).join(""));
+    localStorage.setItem(KEY, id);
+  }
+  return id;
+}
+const CLIENT_ID = getClientId();
+
+let npLast = "";
+async function refreshNP() {
+  try {
+    const r = await fetch(`/np?cid=${encodeURIComponent(CLIENT_ID)}`, { cache: "no-store" });
+    if (!r.ok) return;
+    const s = await r.json();
+    // 在线人数
+    renderListeners(s.listeners);
+    // 一级音源 + 二级音源都显示: "网易云 · 每日推荐" (folder/netease 有 dir, spotify/file 没有)
+    let src = s.source ? (SRC_NAMES[s.source.name] || s.source.name) : "";
+    if (s.source && s.source.dir) {
+      const dir = s.source.dir;
+      if (s.source.name === "soundcloud" && dir.startsWith("likes:")) {
+        const user = dir.slice("likes:".length) || "我";
+        src = (src ? src + " · " : "") + user + " 的 Likes";
+      } else {
+        const ctxMap = s.source.name === "soundcloud" ? SC_CTX_NAMES : CTX_NAMES;
+        for (const [k, v] of Object.entries(ctxMap)) {
+          if (dir.startsWith(k)) { src = (src ? src + " · " : "") + v; break; }
+        }
+      }
+    }
+    let track = "";
+    if (s.source && s.source.file) {
+      if (s.source.name === "netease" || s.source.name === "soundcloud") track = s.source.file.split(" ").slice(1).join(" ") || s.source.file;
+      else track = s.source.file.split("/").pop();
+    } else if (s.source && s.source.name === "spotify") {
+      track = "Spotify 同步";
+    }
+    const stamp = src + "\0" + track;
+    if (stamp !== npLast) {  // DOM 只在变化时动
+      npLast = stamp;
+      npSrc.textContent = src;
+      npTrack.innerHTML = track ? `<b></b>` : "";
+      if (track) npTrack.querySelector("b").textContent = track;
+    }
+  } catch {}
+}
+refreshNP();
+setInterval(refreshNP, 12000);
+
+</script>
+</body>
+</html>

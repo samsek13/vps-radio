@@ -1,0 +1,461 @@
+#!/usr/bin/env bash
+# netease-helper — 网易云音源辅助: 扫码登录 / 曲目列表 / 歌曲URL解析 / 拉流进 FIFO
+# 由 radiod.sh (stream/list, radiod 用户) 与 radioctl (login/search, ubuntu 用户) 共用。
+# 全部走 music.163.com 明文 /api 端点 + X-Real-IP 伪装头 (海外 VPS 必需, 2026-09-12 实测有效),
+# 不依赖任何 Node 服务/容器。CDN URL ~20 分钟过期 → 每曲播放时现解析。
+#
+# 退出码: 0 成功 / 22 曲目不可播(无权/下架/试听片段) / 23 API/网络失败 / 24 用法/流程错误 / 26 搜索缓存写入失败(沙箱只读等)
+set -uo pipefail
+
+API="https://music.163.com"
+XIP="116.25.137.244"        # 伪装的大陆 IP (广东电信; 若被风控只改这一处)
+UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+COOKIE_FILE="/var/lib/radiod/netease_cookie"     # 单行原始 Cookie 头 (MUSIC_U=...; __csrf=...; ...)
+SEARCH_CACHE="/run/radiod/netease_search.cache"  # radioctl search 写 / list search-cache 读
+PODCAST_SEARCH_CACHE="/run/radiod/netease_podcast_search.cache" # radioctl podcast-search 写 / list podcast-search-cache 读
+NCM_API="http://127.0.0.1:3000"                  # ncm-api 容器 (QR 登录唯一可靠通道; docker 名 ncm-api)
+T=10                        # 单次 API 超时秒数 (daemon 在等, 失败要快)
+
+# 列表行构造: "<歌曲id> <歌名>"。歌名清洗: | → ／, 去 CR/LF (防 7 字段状态文件被竖线污染)
+JQ_LINE='"\(.id) \((.name // "") | gsub("\\|"; "／") | gsub("[\n\r]"; ""))"'
+
+log() { echo "netease-helper: $*" >&2; }
+die() { log "$1"; exit "${2:-23}"; }
+
+usage() {
+    cat >&2 <<'EOF'
+用法: netease-helper <子命令>
+  login                扫码登录 (二维码打终端, 手机网易云 App 扫)
+  login-status         登录态检查 (昵称/VIP)
+  resolve <歌曲id>      解析歌曲 CDN URL (打到 stdout, 调试/预检用)
+  stream <歌曲id> <fifo>  解析并拉流转 s16le 写 fifo (radiod 音源进程)
+  list playlist <歌单id>  歌单 → 每行 "<歌曲id> <歌名>"
+  list album <专辑id>     专辑
+  list podcast <播客id>   播客 (支持数字 ID 或网易云链接)
+  list program <节目id>   播客单集 (支持数字 ID 或网易云链接)
+  list song <歌曲id>      单曲 (支持数字 ID 或网易云链接)
+  list podcasts        已订阅播客列表
+  list fm                私人FM
+  list daily             每日推荐
+  list search-cache      输出 radioctl search 的缓存
+  list podcast-search-cache 输出 radioctl podcast-search 的缓存
+  search <关键词...>      单曲搜索, 编号列表 + 写缓存
+  search-podcast <关键词...> 播客搜索, 编号列表 + 写缓存
+EOF
+    exit "${1:-24}"
+}
+
+cookie_str() { [ -r "$COOKIE_FILE" ] && tr -d '\r\n' < "$COOKIE_FILE" || true; }
+
+napi() {  # napi <path?query> → 响应体 stdout。统一带 X-Real-IP 伪装 + cookie(如有) + os=pc 客户端提示
+    local cookie; cookie=$(cookie_str)
+    local a=(-sS -g --max-time "$T" -H "X-Real-IP: $XIP" -H "User-Agent: $UA")   # -g: URL 含 [ids] 不被 curl 当 glob
+    a+=(-H "Cookie: ${cookie:+$cookie; }os=pc; appver=8.10.35")
+    curl "${a[@]}" "$API$1" || die "网络请求失败: $1"
+}
+
+# ---------- 登录 ----------
+# 走 ncm-api 容器 (docker run 见 RUNBOOK §5): 明文 /api/login/qrcode/* (type=1) 的 803 只发
+# web 游客 cookie (MUSIC_R_T/A_T, 无 MUSIC_U, 实测 2026-09-13); 容器实现完整 weapi/eapi,
+# /login/qr/key + /login/qr/check 的 803 才带 MUSIC_U。容器不在 = login 报错并给出启动指引。
+ncm_up() {  # 容器可达检查 (登录类命令共用)
+    curl -s --max-time 3 "$NCM_API/" >/dev/null 2>&1
+}
+
+ncm_login_error_hint() {
+    echo "ncm-api 容器未运行 ($NCM_API 不可达)。启动:
+  sudo systemctl start ncm-api
+  (或 docker start ncm-api; 首次: docker run -d --name ncm-api --restart unless-stopped \\
+    -p 127.0.0.1:3000:3000 -e http_proxy= -e https_proxy= -e no_proxy= \\
+    -e HTTP_PROXY= -e HTTPS_PROXY= -e NO_PROXY= moefurina/ncm-api:4.40.1)" >&2
+}
+
+ncm_new_key() {  # 取新 unikey → stdout; 失败 die 24
+    local ts j
+    ts=$(date +%s%3N)
+    j=$(curl -s --max-time "$T" "$NCM_API/login/qr/key?timestamp=$ts") || die "取 unikey 失败 (容器异常)"
+    jq -r '.data.unikey // empty' <<<"$j" 2>/dev/null | grep . \
+        || die "取 unikey 失败: $(head -c 100 <<<"$j")"
+}
+
+cmd_login() {
+    ncm_up || { ncm_login_error_hint; exit 24; }
+    local key; key=$(ncm_new_key)
+    local qr="https://music.163.com/login?codekey=$key"
+    echo "用手机网易云音乐 App 扫描以下二维码 (约 5 分钟内有效):"
+    echo
+    command -v qrencode >/dev/null 2>&1 && qrencode -t ANSIUTF8 "$qr" || true
+    echo "终端二维码显示不了时, 用手机浏览器打开: $qr"
+    echo
+    local i=0 last="" resp code
+    while [ "$i" -lt 100 ]; do    # 2s × 100 ≈ 3 分钟, 覆盖二维码生命周期
+        sleep 2; i=$((i+1))
+        ts=$(date +%s%3N)
+        resp=$(curl -s --max-time "$T" "$NCM_API/login/qr/check?key=$key&timestamp=$ts") || continue
+        code=$(jq -r '.code // -1' <<<"$resp" 2>/dev/null)
+        case "$code" in
+            801) [ "$last" != 801 ] && { echo "等待扫码..."; last=801; } ;;
+            802) [ "$last" != 802 ] && { echo "已扫码, 请在手机上点确认"; last=802; } ;;
+            803) save_login_cookie "$resp"; return 0 ;;
+            800) die "二维码已过期, 重新执行 login" 24 ;;
+        esac
+    done
+    die "等待扫码超时 (~3 分钟), 重新执行 login" 24
+}
+
+# ---------- 登录 (网页非阻塞变体, admin 面板用) ----------
+# login-qr-url: 出码即退 (stdout 两行: key 和 二维码内容 URL), 轮询交给前端
+cmd_login_qr_url() {
+    ncm_up || { ncm_login_error_hint; exit 24; }
+    local key; key=$(ncm_new_key)
+    printf '%s\n' "$key"
+    printf '%s\n' "https://music.163.com/login?codekey=$key"
+}
+
+# login-check <key>: 单次轮询。803 → 走 save_login_cookie 写入并打印状态行; 其余打印 code
+# 退出码: 0 = 803 登录成功 / 1 = 仍在等待(801/802) / 24 = 800 过期或参数错
+cmd_login_check() {
+    local key="${1:-}" ts resp code
+    [ -n "$key" ] || die "用法: netease-helper login-check <key>" 24
+    ncm_up || { ncm_login_error_hint; exit 24; }
+    ts=$(date +%s%3N)
+    resp=$(curl -s --max-time "$T" "$NCM_API/login/qr/check?key=$key&timestamp=$ts") \
+        || die "轮询请求失败" 23
+    code=$(jq -r '.code // -1' <<<"$resp" 2>/dev/null)
+    case "$code" in
+        803) save_login_cookie "$resp" ;;
+        800) echo "EXPIRED"; exit 24 ;;
+        *)   echo "$code"; exit 1 ;;
+    esac
+}
+
+save_login_cookie() {  # save_login_cookie <803 响应 JSON> — 清洗容器 cookie 串 (含 Path/Max-Age 属性) 存文件
+    local resp="$1" cookie
+    cookie=$(jq -r '.cookie // empty' <<<"$resp" 2>/dev/null)
+    grep -q 'MUSIC_U=' <<<"$cookie" 2>/dev/null || die "803 但 cookie 里无 MUSIC_U"
+    # 容器的 cookie 是全部 Set-Cookie join: 字段值后跟 "; Max-Age=...; Path=/x;;" 之类的属性行。
+    # 只取每段第一对 k=v, 丢属性, 去重保序 (python 精确处理, bash 管道在 ;; 分隔上易碎, 实测踩过)
+    cookie=$(python3 - "$cookie" <<'PYEOF'
+import re, sys
+raw = sys.argv[1]
+pairs, seen = [], set()
+for part in re.split(r";;", raw):
+    kv = part.strip().rstrip(";").strip().split(";")[0].strip()
+    if not kv or "=" not in kv:
+        continue
+    k = kv.split("=", 1)[0]
+    if k in ("Path", "Max-Age", "Expires", "Domain", "Secure", "HttpOnly", "SameSite") or k in seen:
+        continue
+    seen.add(k); pairs.append(kv)
+print("; ".join(pairs))
+PYEOF
+) || die "cookie 清洗失败 (python3 异常)"
+    grep -q 'MUSIC_U=' <<<"$cookie" 2>/dev/null || die "清洗后丢失 MUSIC_U (字段形态异常)"
+    printf '%s\n' "$cookie" > "$COOKIE_FILE" \
+        || die "写 $COOKIE_FILE 失败 (文件被删? 重建: sudo install -o radiod -g radiod -m 666 /dev/null $COOKIE_FILE)"
+    echo "登录成功! cookie 已写入 $COOKIE_FILE"
+    cmd_login_status || true
+    echo "提示: MUSIC_U 约 15 天过期, 届时 radioctl netease status 显示未登录, 重新 login 扫码即可"
+}
+
+cmd_login_status() {
+    local j nick vip
+    j=$(napi "/api/nuser/account/get")
+    nick=$(jq -r '.profile.nickname // empty' <<<"$j" 2>/dev/null)
+    if [ -n "$nick" ]; then
+        vip=$(jq -r '.profile.vipType // 0' <<<"$j" 2>/dev/null)
+        case "$vip" in
+            0)  viptxt="无会员" ;;
+            3)  viptxt="黑胶VIP" ;;
+            11) viptxt="黑胶SVIP" ;;
+            *)  viptxt="vipType=$vip" ;;
+        esac
+        echo "已登录: $nick ($viptxt)"
+        return 0
+    fi
+    echo "未登录或 cookie 已失效 (约 15 天过期; 重新执行: radioctl netease login)"
+    return 1
+}
+
+# ---------- URL 解析 / 拉流 ----------
+resolve_url() {  # resolve_url <歌曲id> → URL 到 stdout; 不可播 exit 22; API 异常 exit 23
+    local id="$1" j d0 url
+    j=$(napi "/api/song/enhance/player/url?ids=[$id]&br=999000")
+    [ "$(jq -r '.code // -1' <<<"$j" 2>/dev/null)" = 200 ] \
+        || die "取链接接口异常: $(head -c 100 <<<"$j")"
+    d0=$(jq -c '.data[0] // empty' <<<"$j" 2>/dev/null)
+    [ -n "$d0" ] || die "取链接响应无 data"
+    url=$(jq -r '.url // empty' <<<"$d0")
+    if [ -z "$url" ]; then
+        # 兜底: 检查是否为电台节目 (program) ID (节目有独立的 mainTrackId)
+        local pj mtid
+        pj=$(napi "/api/dj/program/detail?id=$id" 2>/dev/null || true)
+        mtid=$(jq -r '.program.mainTrackId // empty' <<<"$pj" 2>/dev/null)
+        if [ -n "$mtid" ] && [ "$mtid" != "$id" ]; then
+            log "id=$id 是节目 ID, 自动映射至 mainTrackId=$mtid"
+            resolve_url "$mtid"
+            return $?
+        fi
+        log "id=$id 不可播: code=$(jq -r '.code' <<<"$d0") fee=$(jq -r '.fee' <<<"$d0") (无权/下架)"
+        return 22
+    fi
+    if [ "$(jq -r '.freeTrialInfo // empty' <<<"$d0")" != "" ]; then
+        log "id=$id 是 30s 试听片段, 跳过 (fee=$(jq -r '.fee' <<<"$d0"))"
+        return 22
+    fi
+    printf '%s' "$url"
+}
+
+cmd_resolve() {
+    local url; url=$(resolve_url "$1") || exit $?
+    printf '%s\n' "$url"
+}
+
+cmd_stream() {  # 解析失败秒退非 0 → radiod 主循环按"音源快速死亡"前进/连败回退
+    local url; url=$(resolve_url "$1") || exit $?
+    local fifo="$2" ss="${3:-}"
+    local ss_args=()
+    [ -n "$ss" ] && ss_args=(-ss "$ss")
+    # exec: PID 不变 → radiod 的 SRC_PID/term_kill/wait 语义与 file 源完全同构
+    # -rw_timeout 15s: CDN 挂起时 ffmpeg 必退非 0, 不留死寂
+    exec ffmpeg \
+        -hide_banner -loglevel warning -nostdin -y \
+        -rw_timeout 15000000 \
+        "${ss_args[@]}" \
+        -i "$url" \
+        -vn -map 0:a:0 \
+        -ac 2 -ar 44100 -f s16le \
+        "$fifo"
+}
+
+# ---------- 曲目列表 (输出: 每行 "<歌曲id> <歌名>", 即 radiod PLAYLIST 元素格式) ----------
+list_playlist() {
+    local id="$1" j nt nti
+    j=$(napi "/api/playlist/detail?id=$id")
+    [ "$(jq -r '.code // -1' <<<"$j" 2>/dev/null)" = 200 ] || die "歌单 $id 不可用 (id 错或接口异常)"
+    nt=$(jq -r '.result.tracks // [] | length' <<<"$j" 2>/dev/null)
+    nti=$(jq -r '.result.trackIds // [] | length' <<<"$j" 2>/dev/null)
+    if [ "${nt:-0}" -gt 0 ] && [ "$nt" -ge "${nti:-0}" ]; then
+        jq -r ".result.tracks[]? | $JQ_LINE" <<<"$j"
+        return 0
+    fi
+    # 游客/异常时 tracks 被截断 (只回 10 首): 用 trackIds 全量 + song/detail 批量补全 (每批 100)
+    log "tracks($nt) < trackIds($nti), 用 song/detail 批量补全"
+    local ids=() i batch
+    mapfile -t ids < <(jq -r '.result.trackIds[]?.id' <<<"$j" 2>/dev/null)
+    [ "${#ids[@]}" -gt 0 ] || die "歌单 $id 无曲目"
+    for ((i = 0; i < ${#ids[@]}; i += 100)); do
+        batch=$(IFS=,; printf '%s' "${ids[*]:i:100}")
+        napi "/api/song/detail/?ids=%5B${batch//,/%2C}%5D" | jq -r ".songs[]? | $JQ_LINE"
+    done
+}
+
+list_album() {
+    local j
+    j=$(napi "/api/album/$1")     # 注意: 路径参数式, /api/album/detail?id= 形式会 -462
+    [ "$(jq -r '.code // -1' <<<"$j" 2>/dev/null)" = 200 ] || die "专辑 $1 不可用"
+    jq -r ".album.songs[]? | $JQ_LINE" <<<"$j"
+}
+
+list_podcast() {
+    local raw="${1:-}" id
+    # 支持纯数字 ID 或网易云分享链接 (如 https://music.163.com/djradio?id=1214111539 或 /program?id=...)
+    id=$(sed -E 's/.*[?&](id|rid)=([0-9]+).*/\2/; s/.*\/([0-9]+)$/\1/' <<<"$raw")
+    case "$id" in ''|*[!0-9]*) die "播客 id 需为数字或网易云链接: $raw" 24 ;; esac
+
+    # 兼容: 若输入的是节目 (program) ID/链接, 自动定位其所属播客频道 radioId
+    local pj prId
+    pj=$(napi "/api/dj/program/detail?id=$id" 2>/dev/null || true)
+    if [ "$(jq -r '.code // -1' <<<"$pj" 2>/dev/null)" = 200 ]; then
+        prId=$(jq -r '.program.radio.id // empty' <<<"$pj" 2>/dev/null)
+        if [ -n "$prId" ]; then
+            log "输入的是播客单集 #$id ($(jq -r '.program.name' <<<"$pj" 2>/dev/null)), 自动定位所属播客 #$prId ($(jq -r '.program.radio.name' <<<"$pj" 2>/dev/null))"
+            id="$prId"
+        fi
+    fi
+
+    ncm_up || { ncm_login_error_hint; exit 24; }
+
+    local offset=0 limit=100 more="true" total_found=0
+    local cookie; cookie=$(cookie_str)
+    while [ "$more" = "true" ] && [ "$offset" -lt 1000 ]; do
+        local j url
+        url="$NCM_API/dj/program?rid=$id&limit=$limit&offset=$offset&realIP=$XIP"
+        [ -n "$cookie" ] && url="$url&cookie=$(jq -rn --arg c "$cookie" '$c|@uri')"
+        j=$(curl -s --max-time "$T" "$url") || break
+        [ "$(jq -r '.code // -1' <<<"$j" 2>/dev/null)" = 200 ] || break
+        local n
+        n=$(jq -r '.programs // [] | length' <<<"$j" 2>/dev/null)
+        [ "${n:-0}" -gt 0 ] || break
+        # 输出 "<mainTrackId> <歌名>"
+        jq -r ".programs[]? | \"\(.mainTrackId) \((.name // \"\") | gsub(\"\\\\|\"; \"／\") | gsub(\"[\\n\\r]\"; \"\"))\"" <<<"$j"
+        total_found=$((total_found + n))
+        more=$(jq -r '.more // false' <<<"$j" 2>/dev/null)
+        offset=$((offset + n))
+    done
+
+    [ "$total_found" -gt 0 ] || die "播客 $id 不可用 (无曲目或接口异常)"
+}
+
+list_song() {
+    local raw="${1:-}" id
+    id=$(sed -E 's/.*[?&](id|rid)=([0-9]+).*/\2/; s/.*\/([0-9]+)$/\1/' <<<"$raw")
+    case "$id" in ''|*[!0-9]*) die "歌曲 id 需为数字或网易云链接: $raw" 24 ;; esac
+    local j lines
+    j=$(napi "/api/song/detail/?ids=%5B${id}%5D")
+    [ "$(jq -r '.code // -1' <<<"$j" 2>/dev/null)" = 200 ] || die "歌曲 $id 不可用 (id 错或接口异常)"
+    lines=$(jq -r ".songs[]? | $JQ_LINE" <<<"$j" 2>/dev/null)
+    [ -n "$lines" ] || die "歌曲 $id 无信息"
+    printf '%s\n' "$lines"
+}
+
+list_program() {
+    local raw="${1:-}" id
+    id=$(sed -E 's/.*[?&](id|rid)=([0-9]+).*/\2/; s/.*\/([0-9]+)$/\1/' <<<"$raw")
+    case "$id" in ''|*[!0-9]*) die "节目 id 需为数字或网易云链接: $raw" 24 ;; esac
+    local pj mtid name
+    pj=$(napi "/api/dj/program/detail?id=$id")
+    [ "$(jq -r '.code // -1' <<<"$pj" 2>/dev/null)" = 200 ] || die "节目 $id 不可用 (id 错或接口异常)"
+    mtid=$(jq -r '.program.mainTrackId // empty' <<<"$pj" 2>/dev/null)
+    name=$(jq -r '.program.name // ""' <<<"$pj" 2>/dev/null | sed 's/|/／/g' | tr -d '\r\n')
+    [ -n "$mtid" ] || die "节目 $id 无音轨"
+    printf '%s %s\n' "$mtid" "$name"
+}
+
+list_podcast_sub() {
+    ncm_up || { ncm_login_error_hint; exit 24; }
+    local cookie; cookie=$(cookie_str)
+    [ -n "$cookie" ] || die "未登录 (需先 radioctl netease login 扫码登录查看已订阅播客)" 24
+    local j
+    j=$(curl -s --max-time "$T" "$NCM_API/dj/sublist?cookie=$(jq -rn --arg c "$cookie" '$c|@uri')&realIP=$XIP")
+    [ "$(jq -r '.code // -1' <<<"$j" 2>/dev/null)" = 200 ] || die "获取订阅播客失败" 23
+    local count
+    count=$(jq -r '.djRadios // [] | length' <<<"$j" 2>/dev/null)
+    [ "${count:-0}" -gt 0 ] || die "暂无订阅播客" 24
+    echo "已订阅播客 (共 $count 个):"
+    jq -r '.djRadios[] | "\(.id)|\(.name)|\(.dj.nickname // "?")|\(.programCount // 0)"' <<<"$j" \
+        | awk -F'|' '{printf "%2d. %s (共 %d 期) — id: %s (主播: %s)\n", NR, $2, $4, $1, $3}'
+}
+
+list_fm() {
+    local j lines
+    j=$(napi "/api/radio/get")
+    lines=$(jq -r ".data[]? | $JQ_LINE" <<<"$j" 2>/dev/null)
+    [ -n "$lines" ] || die "私人FM 无返回 (cookie 失效? radioctl netease status 检查)"
+    printf '%s\n' "$lines"
+}
+
+list_daily() {
+    local j lines
+    j=$(napi "/api/v3/discovery/recommend/songs")
+    lines=$(jq -r ".data.dailySongs[]? | $JQ_LINE" <<<"$j" 2>/dev/null)
+    if [ -z "$lines" ]; then     # 备用路径
+        j=$(napi "/api/v1/discovery/recommend/songs")
+        lines=$(jq -r ".data.dailySongs[]? | $JQ_LINE" <<<"$j" 2>/dev/null)
+        [ -n "$lines" ] || lines=$(jq -r ".recommendSongs[]? | $JQ_LINE" <<<"$j" 2>/dev/null)
+    fi
+    [ -n "$lines" ] || die "每日推荐不可用 (可先用 radioctl netease fm 代替)"
+    printf '%s\n' "$lines"
+}
+
+cmd_list_search_cache() {
+    [ -s "$SEARCH_CACHE" ] || die "无搜索缓存 (先 radioctl netease search <关键词>)" 24
+    grep . "$SEARCH_CACHE"
+}
+
+cmd_search() {
+    [ $# -ge 1 ] || die "用法: netease-helper search <关键词>" 24
+    local q j n
+    q=$(jq -rn --arg v "$*" '$v|@uri')
+    j=$(napi "/api/search/get/?s=$q&type=1&offset=0&limit=30")
+    n=$(jq -r '.result.songs // [] | length' <<<"$j" 2>/dev/null)
+    [ "${n:-0}" -gt 0 ] || die "无搜索结果 (或接口异常)"
+    echo "搜索结果 (共 $n 条):"
+    jq -r '.result.songs[] | "\(.id)|\(.name)|\(.artists[0].name // "?")|\(((.duration // 0) / 1000) | floor)"' <<<"$j" \
+        | awk -F'|' '{printf "%3d. %s — %s (%d:%02d)\n", NR, $2, $3, $4 / 60, $4 % 60}'
+    # 写缓存 (与 PLAYLIST 元素同格式)。tmp 放 /tmp: 三种上下文都可写 (ubuntu CLI 真实 /tmp;
+    # radio-admin/radiod 沙箱 PrivateTmp tmpfs)。勿用 $HOME — radio-admin 的 ProtectSystem=strict
+    # 把 /var/lib/radiod 挂只读建不了 tmp (2026-09-15 实测踩坑; 面板网易搜索自 09-13 起 502 的根因)。
+    # 成功才覆写 → API 瞬断不会把缓存截断成 0 字节; cat> 已存在的 666 文件不需目录 w
+    local tmp; tmp=$(mktemp /tmp/netease-search.XXXXXX) || tmp="/tmp/netease-search.$$"
+    if jq -r ".result.songs[] | $JQ_LINE" <<<"$j" > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+        if cat "$tmp" > "$SEARCH_CACHE" 2>/dev/null && [ -s "$SEARCH_CACHE" ]; then
+            echo "播放: radioctl netease play <序号> (从 1 起)"
+        else
+            # 缓存没落地 → 后续 play 读不到列表。以前只 warn stderr + 退 0, 面板 (只透传
+            # stdout) 显示"搜索成功"却点不出歌 (2026-09-15 静默失败根因之一)。
+            # 现改为: 失败原因也打到 stdout (面板可见) + 非 0 退出码 26 让调用方知道
+            rm -f "$tmp"
+            echo "缓存写入失败: $SEARCH_CACHE 不可写 (radio-admin 沙箱只读?) — 点播将不可用"
+            die "缓存写入失败: $SEARCH_CACHE 不可写 (radio-admin 沙箱只读?) — 点播将不可用" 26
+        fi
+        rm -f "$tmp"
+    else
+        rm -f "$tmp"
+        log "警告: 搜索结果解析失败, 缓存未更新"
+        return 1
+    fi
+}
+
+cmd_list_podcast_search_cache() {
+    [ -s "$PODCAST_SEARCH_CACHE" ] || die "无播客搜索缓存 (先 radioctl netease podcast-search <关键词>)" 24
+    grep . "$PODCAST_SEARCH_CACHE"
+}
+
+cmd_search_podcast() {
+    [ $# -ge 1 ] || die "用法: netease-helper search-podcast <关键词>" 24
+    local q j n
+    q=$(jq -rn --arg v "$*" '$v|@uri')
+    j=$(napi "/api/search/get/?s=$q&type=1009&offset=0&limit=30")
+    n=$(jq -r '.result.djRadios // [] | length' <<<"$j" 2>/dev/null)
+    [ "${n:-0}" -gt 0 ] || die "无播客搜索结果 (或接口异常)"
+    echo "播客搜索结果 (共 $n 条):"
+    jq -r '.result.djRadios[] | "\(.id)|\(.name)|\(.dj.nickname // "?")|\(.programCount // 0)"' <<<"$j" \
+        | awk -F'|' '{printf "%3d. %s — %s (共 %d 期) [ID: %s]\n", NR, $2, $3, $4, $1}'
+    local tmp; tmp=$(mktemp /tmp/netease-podsearch.XXXXXX) || tmp="/tmp/netease-podsearch.$$"
+    # 缓存格式: 每行 "<播客id> <播客名>"
+    if jq -r '.result.djRadios[] | "\(.id) \((.name // "") | gsub("\\|"; "／") | gsub("[\n\r]"; ""))"' <<<"$j" > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+        if cat "$tmp" > "$PODCAST_SEARCH_CACHE" 2>/dev/null && [ -s "$PODCAST_SEARCH_CACHE" ]; then
+            echo "播放命令: radioctl netease podcast <ID> [shuffle|seq]"
+            echo "或序号播放: radioctl netease podcast-play <序号> [shuffle|seq] (从 1 起)"
+        else
+            rm -f "$tmp"
+            echo "缓存写入失败: $PODCAST_SEARCH_CACHE 不可写"
+            die "缓存写入失败: $PODCAST_SEARCH_CACHE 不可写" 26
+        fi
+        rm -f "$tmp"
+    else
+        rm -f "$tmp"
+        log "警告: 播客搜索结果解析失败, 缓存未更新"
+        return 1
+    fi
+}
+
+# ---------- 分发 ----------
+case "${1:-}" in
+    login)              cmd_login ;;
+    login-status)       cmd_login_status ;;
+    login-qr-url)       cmd_login_qr_url ;;
+    login-check)        [ -n "${2:-}" ] || usage; cmd_login_check "$2" ;;
+    resolve)      [ -n "${2:-}" ] || usage; cmd_resolve "$2" ;;
+    stream)       [ -n "${2:-}" ] && [ -n "${3:-}" ] || usage; cmd_stream "$2" "$3" "${4:-}" ;;
+    list)
+        case "${2:-}" in
+            playlist)     [ -n "${3:-}" ] || usage; list_playlist "$3" ;;
+            album)        [ -n "${3:-}" ] || usage; list_album "$3" ;;
+            podcast)      [ -n "${3:-}" ] || usage; list_podcast "$3" ;;
+            program)      [ -n "${3:-}" ] || usage; list_program "$3" ;;
+            song)         [ -n "${3:-}" ] || usage; list_song "$3" ;;
+            podcasts|podcast-sub) list_podcast_sub ;;
+            fm)           list_fm ;;
+            daily)        list_daily ;;
+            search-cache) cmd_list_search_cache ;;
+            podcast-search-cache) cmd_list_podcast_search_cache ;;
+            *)            usage ;;
+        esac
+        ;;
+    search)               shift; [ $# -ge 1 ] || usage; cmd_search "$@" ;;
+    search-podcast|podcast-search) shift; [ $# -ge 1 ] || usage; cmd_search_podcast "$@" ;;
+    podcasts)             list_podcast_sub ;;
+    *)            usage ;;
+esac

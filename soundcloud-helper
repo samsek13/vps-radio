@@ -1,0 +1,518 @@
+#!/usr/bin/env bash
+# soundcloud-helper — SoundCloud 音源辅助: 匿名 client_id 自愈 / 曲目列表 / 流解析 / 拉流进 FIFO
+# 由 radiod.sh (stream/list, radiod 用户) 与 radioctl (search/status, ubuntu 用户) 共用。
+#
+# 鉴权模型: 无登录无 OAuth。SoundCloud web 端匿名 client_id 免费账号即可读全部公开数据
+# (likes/歌单/搜索/流解析, hq 档只给 Go+ 付费户, 匿名与免费登录同档, 2026-09-14 实测)。
+# CID 会轮换/被 (CID,IP) 软限 → 双 surface (mobile/desktop) 缓存 + 401 自愈刮站刷新。
+#
+# API 形态要点 (与网易不同, 全部 2026-09-14 VPS 实测):
+#   - 转码 URL (transcodings[].url) + "&client_id=" 返回 200 JSON body {url: CDN签名URL}
+#     (不是 302!); CDN URL ~2h 过期, 每曲播放时现解析
+#   - protocol 在 .format.protocol (不是 .protocol)
+#   - ~11% ALLOW 曲只有 HLS 转码 → progressive 优先, HLS aac_160k 回退 (同一 ffmpeg 命令)
+#   - policy: ALLOW=全长 / SNIP=30s试听(免费账号无 Go+) / BLOCK=不可播 — 与网易 VIP 同构
+#
+# 退出码: 0 成功 / 22 曲目不可播(SNIP/BLOCK/无转码) / 23 API/网络失败(CID 自愈也没救回) / 24 用法 / 26 搜索缓存写入失败(沙箱只读等)
+set -uo pipefail
+
+API="https://api-v2.soundcloud.com"
+UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+CID_FILE="/var/lib/radiod/soundcloud_cid"       # 两行 "<surface> <cid>"; 首行=当前生效
+SCRAPE_STAMP="/var/lib/radiod/sc_last_scrape"   # 刮站 15min 防抖 (mtime)
+SEARCH_CACHE="/run/radiod/soundcloud_search.cache"  # radioctl search 写 / list search-cache 读
+T=15                       # 单次 API 超时秒数
+SCRAPE_T=12                # 刮站超时秒数
+CANARY_ID="88335161"       # status 金丝雀探针曲目 (已知 ALLOW: Get Lucky - Daft Punk)
+
+# 列表行构造: "<曲目id> <标题>"。标题清洗同 netease-helper: | → ／, 去 CR/LF
+# (防 7 字段状态文件被竖线污染)
+JQ_LINE='"\(.id) \((.title // "") | gsub("\\|"; "／") | gsub("[\n\r]"; ""))"'
+
+log() { echo "soundcloud-helper: $*" >&2; }
+die() { log "$1"; exit "${2:-23}"; }
+uri_enc() { jq -rn --arg v "$1" '$v|@uri'; }
+
+usage() {
+    cat >&2 <<'EOF'
+用法: soundcloud-helper <子命令>
+  status                        CID 金丝雀 (当前 surface/CID + 探针曲目连通性)
+  resolve <曲目id>              解析流 CDN URL (打到 stdout, 调试/预检用)
+  resolve-id <链接或ID>         解析歌单链接或 ID → 纯数字歌单 ID
+  resolve-track <链接或ID>      解析单曲链接或 ID → 纯数字单曲 ID
+  stream <曲目id> <fifo>        解析并拉流转 s16le 写 fifo (radiod 音源进程)
+  list likes <用户permalink>    用户 likes (仅可播曲目) → 每行 "<曲目id> <标题>"
+  list playlist <歌单id>        歌单 (仅可播) → 每行 "<曲目id> <标题>"
+  list track <曲目链接或id>     单曲 → 1 行 "<曲目id> <标题>"
+  list search-cache             输出 radioctl search 的缓存
+  search <关键词...>            搜索, 编号列表 + 写缓存
+EOF
+    exit "${1:-24}"
+}
+
+# ---------- CID 管理 ----------
+# 文件两行 "<surface> <cid>", 首行 = 当前生效。写需 root/radiod; radioctl(ubuntu) 只读。
+# 无文件/格式坏 → 尝试写入已知双 CID (2026-09-14 实测有效; 后续靠自愈保持新鲜)。
+# 写不了 (ubuntu 调用) → 不死: load_cids 用内置默认值内存兜底, 部署时预建文件后 ubuntu 正常只读。
+cid_init_default() {
+    { printf 'mobile KKzJxmw11tYpCs6T24P4uUYhqmjalG6M\ndesktop Pb72ranhoyt6gw7hM7TkzUItXlMWSNSo\n' \
+        > "$CID_FILE" && chmod 666 "$CID_FILE"; } 2>/dev/null || true
+}
+
+load_cids() {
+    # → CUR_CID / CUR_SURF / ALT_CID / ALT_SURF (全局)
+    [ -r "$CID_FILE" ] || cid_init_default
+    mapfile -t _lines < "$CID_FILE" 2>/dev/null
+    CUR_CID=""; CUR_SURF=""; ALT_CID=""; ALT_SURF=""
+    local ok=0 i surf cid
+    for i in 0 1; do
+        [ -n "${_lines[$i]:-}" ] || continue
+        surf="${_lines[$i]%% *}"; cid="${_lines[$i]#* }"
+        [ "$surf" != "$cid" ] && [ ${#cid} -ge 20 ] || continue
+        if [ -z "$CUR_CID" ]; then CUR_SURF="$surf"; CUR_CID="$cid"; ok=1
+        elif [ "$surf" != "$CUR_SURF" ]; then ALT_SURF="$surf"; ALT_CID="$cid"
+        fi
+    done
+    [ "$ok" = 1 ] || { log "CID 文件不可用 ($CID_FILE), 用内置默认双 surface (mobile 优先)";
+                       CUR_SURF="mobile"; CUR_CID="KKzJxmw11tYpCs6T24P4uUYhqmjalG6M";
+                       ALT_SURF="desktop"; ALT_CID="Pb72ranhoyt6gw7hM7TkzUItXlMWSNSo"; }
+}
+
+scrape_mobile() {  # m.soundcloud.com __NEXT_DATA__ → stdout CID; 空=失败。主刷新路 (无 WAF, 1 请求)
+    curl -s -A "$UA" --max-time "$SCRAPE_T" https://m.soundcloud.com/ 2>/dev/null \
+        | grep -oE '"clientId":"[0-9A-Za-z_-]{20,40}"' | head -1 \
+        | grep -oE '[0-9A-Za-z_-]{20,40}' | tr -d '"'
+}
+
+scrape_desktop() {  # 桌面 asset 扫描 → stdout CID; 空=失败。备路 (首页偶发 WAF 202; 倒序扫, yt-dlp 同款)
+    local html u cid
+    html=$(curl -s -A "$UA" --max-time "$SCRAPE_T" https://soundcloud.com/ 2>/dev/null)
+    [ -n "$html" ] || return 1
+    # 反向 (新 chunk 优先, 2026-01 SC 把 ID 挪过位置); 9 asset 全下太贵 → 先后两轮各扫到即出
+    local -a assets
+    mapfile -t assets < <(grep -oE 'https://a-v2\.sndcdn\.com/assets/[A-Za-z0-9._-]+\.js' <<<"$html" | awk '!seen[$0]++' | tac)
+    for u in "${assets[@]}"; do
+        cid=$(curl -s -A "$UA" --max-time "$SCRAPE_T" "$u" 2>/dev/null \
+              | grep -oE 'client_id["'\'' ]{0,3}[:=]["'\'' ]{0,3}[0-9A-Za-z_-]{32}' \
+              | head -1 | grep -oE '[0-9A-Za-z_-]{32}$')
+        [ -n "$cid" ] && { printf '%s' "$cid"; return 0; }
+    done
+    return 1
+}
+
+refresh_cid() {  # 401 时调。刮站 (15min 防抖) → 新≠旧则换主重试; 新=旧(软限)则切备用 surface。
+    # 结果: CUR_CID/CUR_SURF 更新 (内存+文件), 返回 0=有变化可重试 / 1=没辙
+    # 防抖: 15 分钟内不重复刮站 (软限场景刮站也拿不到新值, 白烧请求)
+    if [ -e "$SCRAPE_STAMP" ]; then
+        local age=$(( $(date +%s) - $(stat -c %Y "$SCRAPE_STAMP" 2>/dev/null || echo 0) ))
+        if [ "$age" -lt 900 ]; then
+            log "刮站防抖中 (${age}s < 900s), 改切备用 surface"
+            swap_alt || return 1
+            return 0
+        fi
+    fi
+    touch "$SCRAPE_STAMP" 2>/dev/null
+    local fresh=""
+    fresh=$(scrape_mobile)
+    [ -z "$fresh" ] && fresh=$(scrape_desktop)
+    if [ -n "$fresh" ] && [ "$fresh" != "$CUR_CID" ] && [ "$fresh" != "$ALT_CID" ]; then
+        log "刮到新 CID (旧 $CUR_SURF/$CUR_CID → 新 $fresh), 换主重试"
+        ALT_CID="$CUR_CID"; ALT_SURF="$CUR_SURF"
+        CUR_CID="$fresh"; CUR_SURF="fresh"
+        save_cids
+        return 0
+    fi
+    # 新=旧或刮失败: 轮换没发生 → 是 (CID,IP) 软限 → 切备用 surface
+    swap_alt || return 1
+    return 0
+}
+
+swap_alt() {  # 当前/备用互换。备用也没有 → 1
+    if [ -n "$ALT_CID" ]; then
+        local c="$CUR_CID" s="$CUR_SURF"
+        CUR_CID="$ALT_CID"; CUR_SURF="$ALT_SURF"
+        ALT_CID="$c"; ALT_SURF="$s"
+        log "切换备用 surface → $CUR_SURF/$CUR_CID"
+        save_cids
+        return 0
+    fi
+    log "无备用 surface 可切"
+    return 1
+}
+
+save_cids() {
+    # 写文件失败不致命 (radioctl 以 ubuntu 跑时写不了 → 仅本次进程内生效, radiod 下次自愈)
+    { printf '%s %s\n' "$CUR_SURF" "$CUR_CID"; [ -n "$ALT_CID" ] && printf '%s %s\n' "$ALT_SURF" "$ALT_CID"; } \
+        > "$CID_FILE" 2>/dev/null || true
+}
+
+# 统一 API 入口: sc_api <path?query 或 完整URL> → 响应体 stdout; 失败 return 1 (调用方 || die)。
+# 401/403 → 自愈链 (刮站→换 CID) 重试一次; 仍败 → sleep 15 (自限速, 连跳场景 ~4 次/min)
+# + return 1。其余非 200 (含 429/网络) 不重试 (429 窗口 ~10min, 立刻重试只会更深)。
+# 注意: 调用方必须 "$(sc_api ...)" || die 形态 — 子壳里 exit 只会死子壳, 主壳拿空串继续跑。
+sc_api() {
+    local req="$1" body code i sep
+    case "$req" in
+        https://*) : ;;
+        *)         req="$API$req" ;;
+    esac
+    # URL 里已有 query (含我们 path 形态的尾 &) → 用 & 接 client_id, 否则用 ?
+    case "$req" in
+        *\?*) sep="&" ;;
+        *)    sep="?" ;;
+    esac
+    for i in 1 2; do
+        body=$(curl -s -A "$UA" --max-time "$T" -w '\n%{http_code}' "${req}${sep}client_id=$CUR_CID" 2>/dev/null) || body=""
+        code="${body##*$'\n'}"
+        body="${body%$'\n'*}"
+        if [ "$code" = 200 ] && [ -n "$body" ]; then
+            printf '%s' "$body"
+            return 0
+        fi
+        if [ "$code" = 401 ] || [ "$code" = 403 ]; then
+            if [ "$i" = 1 ]; then
+                log "API $code (client_id 失效/软限), 尝试自愈"
+                refresh_cid || break
+                continue
+            fi
+            break
+        fi
+        # 429 / 000(网络) / 5xx → 不换 CID 白折腾, 直接走失败
+        break
+    done
+    sleep 15
+    return 1
+}
+
+# 便捷封装: sc_api_jq <path> <jq表达式> → 取值 (失败/空 → die 23)。列表计数场景给第 3 参默认值
+jcount() {  # jcount <json> [默认0] → jq '.collection|length' 数字 (空/坏 json 不炸)
+    local n
+    n=$(jq -r '.collection | length' <<<"$1" 2>/dev/null)
+    printf '%s' "${n:-${2:-0}}"
+}
+
+# ---------- URL 解析 / 拉流 ----------
+resolve_url() {  # resolve_url <曲目id> → CDN URL 到 stdout; 不可播 exit 22; API 异常 exit 23 (经 sc_api)
+    local id="$1" j pol dur full turl murl
+    j=$(sc_api "/tracks/$id?") || die "取曲目 $id 失败 (API)"
+    pol=$(jq -r '.policy // empty' <<<"$j" 2>/dev/null)
+    dur=$(jq -r '.duration // 0' <<<"$j" 2>/dev/null)
+    full=$(jq -r '.full_duration // 0' <<<"$j" 2>/dev/null)
+    [ -n "$pol" ] || die "曲目 $id 响应无 policy (id 错或下架)" 22
+    if [ "$pol" != "ALLOW" ]; then
+        log "id=$id 不可播: policy=$pol (SNIP=30s试听/BLOCK=受限)"
+        return 22
+    fi
+    # 兜底: policy 漂移/缓存脏 (列表后曲目被改 SNIP) — duration 留 30000 是试听长
+    if [ "$dur" = 30000 ] && [ "${full:-0}" -gt 30000 ] 2>/dev/null; then
+        log "id=$id duration=30000 但全长 ${full}ms, 是试听片段, 跳过"
+        return 22
+    fi
+    # 转码选择: progressive+audio/mpeg 优先 (超长 DJ set 必须走: HLS 签名 ~2h 过期, 10h set 会截断);
+    # 否则 HLS aac_160k (非 legacy); 再否则任意非 abr/ctr-/cbc- 的 HLS (DRM/已知坏档全跳过)
+    turl=$(jq -r '.media.transcodings[]?
+        | select(.format.protocol=="progressive" and .format.mime_type=="audio/mpeg")
+        | .url' <<<"$j" 2>/dev/null | head -1)
+    if [ -z "$turl" ]; then
+        turl=$(jq -r '.media.transcodings[]?
+            | select(.format.protocol=="hls")
+            | select((.preset.template_name // "") == "aac_160k")
+            | .url' <<<"$j" 2>/dev/null | head -1)
+    fi
+    if [ -z "$turl" ]; then
+        turl=$(jq -r '.media.transcodings[]?
+            | select(.format.protocol=="hls")
+            | select((.preset.template_name // "") | test("abr|ctr-|cbc-") | not)
+            | .url' <<<"$j" 2>/dev/null | head -1)
+    fi
+    [ -n "$turl" ] || { log "id=$id 无可用转码 (progressive/HLS 均无或只剩 DRM/abr 档)"; return 22; }
+    # 转码 URL + client_id → JSON body {url: CDN 签名 URL} (不是 302)
+    # 注意: sc_api 在 "$( )" 子壳里跑, 其自愈 (refresh_cid) 只改子壳变量+文件;
+    # 主壳 CUR_CID 可能仍是失效旧值 → 此处重读文件拿自愈后的新 CID
+    load_cids
+    murl=$(curl -s -A "$UA" --max-time "$T" "$turl?client_id=$CUR_CID" 2>/dev/null | jq -r '.url // empty' 2>/dev/null)
+    [ -n "$murl" ] || die "转码 URL 取 CDN 失败 (id=$id, 接口异常)"
+    printf '%s' "$murl"
+}
+
+cmd_resolve() {
+    local url; url=$(resolve_url "$1") || exit $?
+    printf '%s\n' "$url"
+}
+
+cmd_stream() {  # 解析失败秒退非 0 → radiod 主循环按"音源快速死亡"前进 (SNIP/BLOCK=22 秒退)
+    local url; url=$(resolve_url "$1") || exit $?
+    local fifo="$2" ss="${3:-}"
+    local ss_args=()
+    [ -n "$ss" ] && ss_args=(-ss "$ss")
+    # exec: PID 不变 → radiod 的 SRC_PID/term_kill/wait 语义与 file/netease 源完全同构
+    # -rw_timeout 15s: CDN 挂起时 ffmpeg 必退非 0, 不留死寂 (同 netease)
+    # 同一命令 progressive(mp3) 与 HLS(m3u8) 都吃 (2026-09-14 VPS ffmpeg 6.1.1 实证)
+    exec ffmpeg \
+        -hide_banner -loglevel warning -nostdin -y \
+        -rw_timeout 15000000 \
+        "${ss_args[@]}" \
+        -user_agent "$UA" \
+        -i "$url" \
+        -vn -map 0:a:0 \
+        -ac 2 -ar 44100 -f s16le \
+        "$fifo"
+}
+
+# ---------- 曲目列表 (输出: 每行 "<曲目id> <标题>", 即 radiod PLAYLIST 元素格式) ----------
+list_likes() {
+    # 用户 likes → 只取 .track 子对象 (feed 混着 liked playlists, .playlist 子对象), 只留 ALLOW
+    local permalink="$1" j uid
+    j=$(sc_api "/resolve?url=https%3A%2F%2Fsoundcloud.com%2F$(uri_enc "$permalink")&") \
+        || die "resolve '$permalink' 失败 (API)"
+    [ "$(jq -r '.kind // empty' <<<"$j" 2>/dev/null)" = "user" ] \
+        || die "permalink '$permalink' 不是用户主页 (resolve kind=$(jq -r '.kind // "空"' <<<"$j" 2>/dev/null))" 23
+    uid=$(jq -r '.id' <<<"$j" 2>/dev/null)
+    local page=1 total=0 skipped=0 collected="" url want_id
+    url="/users/$uid/likes?limit=200&"
+    while :; do
+        j=$(sc_api "$url") || die "取 likes 页失败 (API, 用户 $permalink)"
+        [ -n "$collected" ] && collected+=$'\n'
+        collected+=$(jq -r '[.collection[]? | select(.track != null) | select(.track.policy == "ALLOW") | .track] | .[] | '"$JQ_LINE" <<<"$j" 2>/dev/null)
+        skipped=$(( skipped + $(jq -r '[.collection[]? | select(.track != null) | select(.track.policy != "ALLOW")] | length' <<<"$j" 2>/dev/null) ))
+        total=$(( total + $(jcount "$j") ))
+        url=$(jq -r '.next_href // empty' <<<"$j" 2>/dev/null)
+        # 终止: next_href 值 null / 空 (值判断! key 永远存在); 空页也算完
+        [ -z "$url" ] && break
+        [ "$(jcount "$j")" -eq 0 ] 2>/dev/null && break
+        # next_href 是完整 URL, sc_api 直接收 (自动补 client_id)
+        page=$((page + 1))
+        [ "$page" -gt 50 ] && { log "likes 超 50 页, 截断"; break; }
+        sleep 1
+    done
+    [ -n "$(grep . <<<"$collected")" ] || die "用户 '$permalink' likes 无可播曲目 (全 SNIP/BLOCK 或私密)" 23
+    grep . <<<"$collected"
+    log "likes: $(grep -c . <<<"$collected") 首可播 (likes 共 $total 条, 过滤 liked-playlists + SNIP/BLOCK $skipped 首)"
+}
+
+cmd_resolve_id() {
+    local target="$1"
+    if [[ "$target" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "$target"
+        return 0
+    fi
+    local m_urn
+    m_urn=$(grep -oE '(playlists[:/]|playlists%2F)[0-9]+' <<<"$target" | grep -oE '[0-9]+' | head -1)
+    if [ -n "$m_urn" ]; then
+        printf '%s\n' "$m_urn"
+        return 0
+    fi
+    local u
+    u=$(grep -oE 'https?://[^ "]+' <<<"$target" | head -1)
+    [ -n "$u" ] || u="$target"
+    [[ "$u" =~ ^https?:// ]] || u="https://$u"
+    if [[ "$u" =~ on\.soundcloud\.com ]]; then
+        local final_u
+        final_u=$(curl -s -I -L -o /dev/null -w '%{url_effective}' --max-time 10 "$u" 2>/dev/null)
+        [ -n "$final_u" ] && u="$final_u"
+    fi
+    u="${u//m.soundcloud.com/soundcloud.com}"
+    m_urn=$(grep -oE '(playlists[:/]|playlists%2F)[0-9]+' <<<"$u" | grep -oE '[0-9]+' | head -1)
+    if [ -n "$m_urn" ]; then
+        printf '%s\n' "$m_urn"
+        return 0
+    fi
+    local j id
+    j=$(sc_api "/resolve?url=$(uri_enc "$u")&") || {
+        local html
+        html=$(curl -s -A "$UA" -L --max-time "$T" "$u" 2>/dev/null)
+        id=$(grep -oE 'soundcloud://playlists:[0-9]+|"id":[0-9]+,"kind":"playlist"' <<<"$html" | grep -oE '[0-9]+' | head -1)
+        if [ -n "$id" ]; then
+            printf '%s\n' "$id"
+            return 0
+        fi
+        die "无法从链接解析出歌单 ID: $target" 23
+    }
+    id=$(jq -r '.id // empty' <<<"$j" 2>/dev/null)
+    [ -n "$id" ] || die "解析成功但未返回 ID: $target" 23
+    printf '%s\n' "$id"
+}
+
+list_playlist() {
+    # 歌单内嵌全量曲目 (~99% 是 4 键 stub: id+policy, 无 title) → 批量补全 (每批 ≤50, 按 .id join)
+    local raw="$1" id
+    id=$(cmd_resolve_id "$raw") || exit $?
+    local j want got
+    j=$(sc_api "/playlists/$id?") || die "取歌单 $id 失败 (API)"
+    want=$(jq -r '.track_count // 0' <<<"$j" 2>/dev/null)
+    got=$(jq -r '.tracks // [] | length' <<<"$j" 2>/dev/null)
+    [ "$got" -gt 0 ] || die "歌单 $id 取不到曲目 (id 错或私密)" 23
+    if [ "$want" != "$got" ]; then
+        log "歌单声明 $want 首但内嵌 $got 首 (超出 500 上限或接口异常), 以下嵌为准"
+    fi
+    local skipped n=0 batch out="" ids i tid
+    skipped=$(jq -r '[.tracks[]? | select(.policy != "ALLOW")] | length' <<<"$j" 2>/dev/null)
+    ids=$(jq -r '[.tracks[]? | select(.policy == "ALLOW") | .id] | join(",")' <<<"$j" 2>/dev/null)
+    [ -n "$ids" ] || { log "歌单 $id 全部曲目不可播 (SNIP/BLOCK)"; return 23; }
+    # 分批 ≤50 (51+ 返 400); 批返回是乱序数组 → 最后按 .id 对齐原顺序
+    local -a all=(${ids//,/ })
+    for ((i = 0; i < ${#all[@]}; i += 50)); do
+        batch=$(IFS=,; printf '%s' "${all[*]:i:50}")
+        j=$(sc_api "/tracks?ids=$batch&") || die "批量补全批 $((i/50+1)) 失败 (API)"
+        local lines
+        lines=$(jq -r '.[]? | '"$JQ_LINE" <<<"$j" 2>/dev/null)
+        if [ "$(grep -c . <<<"$lines" 2>/dev/null || echo 0)" -ne "$(echo "$batch" | tr ',' '\n' | grep -c .)" ]; then
+            log "批 $((i/50+1)) 返回数与请求不符, 逐曲回退补全"
+            for tid in ${batch//,/ }; do
+                local tj; tj=$(sc_api "/tracks/$tid?") || die "逐曲补全 $tid 失败 (API)"
+                out+=$'\n'"$(jq -r "$JQ_LINE" <<<"$tj" 2>/dev/null)"
+            done
+        else
+            out+=$'\n'"$lines"
+        fi
+        n=$(( n + $(echo "$batch" | tr ',' '\n' | grep -c .) ))
+        sleep 1
+    done
+    [ -n "$(grep . <<<"$out")" ] || die "歌单 $id 无可播曲目" 23
+    # 按 .id 输出对齐原始歌单顺序 (返回乱序)
+    local ordered="" want_id
+    while IFS= read -r want_id; do
+        [ -n "$want_id" ] || continue
+        ordered+=$'\n'"$(grep "^$want_id " <<<"$out")"
+    done <<<"$(echo "$ids" | tr ',' '\n')"
+    grep . <<<"$ordered"
+    log "歌单: $n 首可播 (内嵌 $got 首, 过滤 SNIP/BLOCK $skipped 首)"
+}
+
+cmd_resolve_track_id() {
+    local target="$1"
+    if [[ "$target" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "$target"
+        return 0
+    fi
+    local m_urn
+    m_urn=$(grep -oE '(tracks[:/]|tracks%2F)[0-9]+' <<<"$target" | grep -oE '[0-9]+' | head -1)
+    if [ -n "$m_urn" ]; then
+        printf '%s\n' "$m_urn"
+        return 0
+    fi
+    local u
+    u=$(grep -oE 'https?://[^ "]+' <<<"$target" | head -1)
+    [ -n "$u" ] || u="$target"
+    [[ "$u" =~ ^https?:// ]] || u="https://$u"
+    if [[ "$u" =~ on\.soundcloud\.com ]]; then
+        local final_u
+        final_u=$(curl -s -I -L -o /dev/null -w '%{url_effective}' --max-time 10 "$u" 2>/dev/null)
+        [ -n "$final_u" ] && u="$final_u"
+    fi
+    u="${u//m.soundcloud.com/soundcloud.com}"
+    m_urn=$(grep -oE '(tracks[:/]|tracks%2F)[0-9]+' <<<"$u" | grep -oE '[0-9]+' | head -1)
+    if [ -n "$m_urn" ]; then
+        printf '%s\n' "$m_urn"
+        return 0
+    fi
+    local j id
+    j=$(sc_api "/resolve?url=$(uri_enc "$u")&") || {
+        local html
+        html=$(curl -s -A "$UA" -L --max-time "$T" "$u" 2>/dev/null)
+        id=$(grep -oE 'soundcloud://tracks:[0-9]+|"id":[0-9]+,"kind":"track"' <<<"$html" | grep -oE '[0-9]+' | head -1)
+        if [ -n "$id" ]; then
+            printf '%s\n' "$id"
+            return 0
+        fi
+        die "无法从链接解析出单曲 ID: $target" 23
+    }
+    id=$(jq -r '.id // empty' <<<"$j" 2>/dev/null)
+    [ -n "$id" ] || die "解析成功但未返回 ID: $target" 23
+    printf '%s\n' "$id"
+}
+
+list_track() {
+    local raw="$1" id
+    id=$(cmd_resolve_track_id "$raw") || exit $?
+    local j line policy
+    j=$(sc_api "/tracks/$id?") || die "取曲目 $id 失败 (API)"
+    policy=$(jq -r '.policy // empty' <<<"$j" 2>/dev/null)
+    if [ "$policy" = "SNIP" ]; then
+        log "曲目 $id 是 30s 试听片段 (Go+ 专享), 跳过"
+        exit 22
+    elif [ "$policy" = "BLOCK" ]; then
+        log "曲目 $id 不可播 (BLOCK 版权或地区受限)"
+        exit 22
+    fi
+    line=$(jq -r "$JQ_LINE" <<<"$j" 2>/dev/null)
+    [ -n "$line" ] || die "曲目 $id 解析失败" 23
+    printf '%s\n' "$line"
+}
+
+cmd_list_search_cache() {
+    [ -s "$SEARCH_CACHE" ] || die "无搜索缓存 (先 radioctl soundcloud search <关键词>)" 24
+    grep . "$SEARCH_CACHE"
+}
+
+cmd_search() {
+    [ $# -ge 1 ] || die "用法: soundcloud-helper search <关键词>" 24
+    local q j n
+    q=$(jq -rn --arg v "$*" '$v|@uri')
+    j=$(sc_api "/search/tracks?q=$q&limit=30&") || die "搜索 '$*' 失败 (API)"
+    n=$(jq -r '.collection // [] | length' <<<"$j" 2>/dev/null)
+    [ "${n:-0}" -gt 0 ] || die "无搜索结果 (或接口异常)"
+    echo "搜索结果 (共 $n 条, ✂=30s试听不可播):"
+    # 时长 h:mm:ss (DJ set 动辄数小时, netease 的 m:ss 不够)
+    jq -r '.collection[] | "\(.id)|\(.title)|\(.user.username // "?")|\(.duration // 0)|\(.policy // "?")"' <<<"$j" \
+        | awk -F'|' '{d=$4/1000; h=int(d/3600); m=int((d%3600)/60); s=int(d%60);
+            if ($5=="SNIP") snip=" ✂"; else snip="";
+            if (h>0) dur=sprintf("%d:%02d:%02d", h, m, s); else dur=sprintf("%d:%02d", m, s);
+            printf "%3d. %s — %s (%s)%s\n", NR, $2, $3, dur, snip}'
+    # 缓存: 全量写入 (含 SNIP; 播到时 resolve gate 跳过 — 与 netease 搜索点歌语义一致)
+    # tmp 放 /tmp: 三种调用上下文都可写 (ubuntu CLI 真实 /tmp; radio-admin/radiod 沙箱
+    # 的 PrivateTmp tmpfs)。勿用 $HOME — radio-admin 的 ProtectSystem=strict 把
+    # /var/lib/radiod 挂只读, 建不了 tmp (2026-09-15 实测踩坑, netease-helper 同款 bug)
+    # 成功才覆写 → API 瞬断不会把缓存截断成 0 字节; cat> 已存在的 666 文件不需目录 w
+    local tmp; tmp=$(mktemp /tmp/sc-search.XXXXXX) || tmp="/tmp/sc-search.$$"
+    if jq -r ".collection[] | $JQ_LINE" <<<"$j" > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+        if cat "$tmp" > "$SEARCH_CACHE" 2>/dev/null && [ -s "$SEARCH_CACHE" ]; then
+            echo "播放: radioctl soundcloud play <序号> (从 1 起)"
+        else
+            # 缓存没落地 → 后续 play 读不到列表。以前只 warn stderr + 退 0, 面板 (只透传
+            # stdout) 显示"搜索成功"却点不出歌 (2026-09-15 静默失败根因之一, netease-helper 同款)。
+            # 现改为: 失败原因也打到 stdout (面板可见) + 非 0 退出码 26 让调用方知道
+            rm -f "$tmp"
+            echo "缓存写入失败: $SEARCH_CACHE 不可写 (radio-admin 沙箱只读?) — 点播将不可用"
+            die "缓存写入失败: $SEARCH_CACHE 不可写 (radio-admin 沙箱只读?) — 点播将不可用" 26
+        fi
+        rm -f "$tmp"
+    else
+        rm -f "$tmp"
+        log "警告: 搜索结果解析失败, 缓存未更新"
+        return 1
+    fi
+}
+
+cmd_status() {
+    load_cids
+    local code
+    code=$(curl -s -A "$UA" --max-time "$T" -o /dev/null -w '%{http_code}' \
+        "$API/tracks/$CANARY_ID?client_id=$CUR_CID" 2>/dev/null)
+    case "$code" in
+        200) echo "CID 健康: $CUR_SURF/$CUR_CID (探针曲 $CANARY_ID → 200)"; return 0 ;;
+        401|403) echo "CID 失效/软限: $CUR_SURF/$CUR_CID (探针 → $code)。备用: ${ALT_SURF:-无}/${ALT_CID:-无}。播放时会自动刮站自愈" >&2; return 1 ;;
+        *) echo "接口异常: 探针 → HTTP $code (网络/风控?)。备用 CID: ${ALT_SURF:-无}/${ALT_CID:-无}" >&2; return 1 ;;
+    esac
+}
+
+# ---------- 分发 ----------
+load_cids
+case "${1:-}" in
+    status)              cmd_status ;;
+    resolve)      [ -n "${2:-}" ] || usage; cmd_resolve "$2" ;;
+    resolve-id)   [ -n "${2:-}" ] || usage; cmd_resolve_id "$2" ;;
+    resolve-track) [ -n "${2:-}" ] || usage; cmd_resolve_track_id "$2" ;;
+    stream)       [ -n "${2:-}" ] && [ -n "${3:-}" ] || usage; cmd_stream "$2" "$3" "${4:-}" ;;
+    list)
+        case "${2:-}" in
+            likes)       [ -n "${3:-}" ] || usage; list_likes "$3" ;;
+            playlist)    [ -n "${3:-}" ] || usage; list_playlist "$3" ;;
+            track)       [ -n "${3:-}" ] || usage; list_track "$3" ;;
+            search-cache) cmd_list_search_cache ;;
+            *)            usage ;;
+        esac
+        ;;
+    search)       shift; [ $# -ge 1 ] || usage; cmd_search "$@" ;;
+    *)            usage ;;
+esac

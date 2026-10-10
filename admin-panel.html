@@ -1,0 +1,822 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>JAM · 控制台</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: #14121c; color: #e8e4f0;
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    padding: 20px 16px 60px;
+  }
+  .wrap { max-width: 760px; margin: 0 auto; }
+  h1 { font-size: 20px; letter-spacing: .1em; margin: 4px 0 2px; }
+  .sub { color: #9a8fb8; font-size: 12px; margin-bottom: 20px; }
+  .card {
+    background: #1d1930; border: 1px solid #2e2848; border-radius: 12px;
+    padding: 16px 18px; margin-bottom: 14px;
+  }
+  .card h2 { font-size: 13px; color: #b3a6d9; margin: 0 0 12px; font-weight: 600; letter-spacing: .06em; }
+  .status-line { font-size: 15px; margin: 3px 0; }
+  .dim { color: #9a8fb8; font-size: 12px; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; margin-left: 6px; vertical-align: middle; }
+  .ok   { background: #1d3a2a; color: #7fe0a8; }
+  .bad  { background: #3a1d1d; color: #e89f9f; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  button, select, input[type=text], input[type=number] {
+    font: inherit; border-radius: 8px; border: 1px solid #3a3358;
+    background: #262140; color: #e8e4f0; padding: 8px 14px; cursor: pointer;
+  }
+  button:hover { background: #322a56; }
+  button.primary { background: #53288f; border-color: #6a3fb8; font-weight: 600; }
+  button.primary:hover { background: #6a35c4; }
+  button.active { background: #53288f; border-color: #8a63d2; font-weight: 600; color: #fff; box-shadow: 0 0 10px rgba(138,99,210,.35); }
+  button:disabled { opacity: .45; cursor: default; }
+  input[type=text], input[type=number] { cursor: text; min-width: 120px; }
+  label.inline { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: #b3a6d9; }
+  .list { max-height: 220px; overflow-y: auto; font-size: 13px; }
+  .list .item { padding: 6px 4px; border-bottom: 1px solid #2e2848; display: flex; justify-content: space-between; gap: 8px; }
+  .list .item span.nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .list .item button { padding: 2px 10px; font-size: 12px; }
+  pre.out {
+    background: #12101a; border: 1px solid #2e2848; border-radius: 8px;
+    padding: 10px 12px; font-size: 12.5px; white-space: pre-wrap; max-height: 260px; overflow-y: auto;
+  }
+  #toast {
+    position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%);
+    background: #53288f; padding: 9px 20px; border-radius: 10px; font-size: 13px;
+    opacity: 0; transition: opacity .25s; pointer-events: none; box-shadow: 0 4px 22px rgba(0,0,0,.5);
+  }
+  #toast.show { opacity: 1; }
+  #toast.err { background: #8f2851; }
+  .qrbox { text-align: center; margin-top: 10px; }
+  .qrbox img { background: #fff; padding: 10px; border-radius: 8px; width: 200px; height: 200px; }
+  .grid2 { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; }
+  /* 音源三个子模块 */
+  .src { background: #17141f; border: 1px solid #2a2440; border-radius: 10px; padding: 13px 15px; }
+  .src-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+  .src h3 { display: flex; align-items: center; gap: 8px; font-size: 14px; margin: 0 0 12px; }
+  .src .chip { display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; border-radius: 7px; font-size: 13px; flex: none; font-weight: 700; }
+  .src-spotify { border-top: 3px solid #1DB954; }
+  .src-spotify .chip { background: #1DB954; color: #04160b; }
+  .src-media { border-top: 3px solid #5b9cf6; }
+  .src-media .chip { background: #5b9cf6; color: #0b1830; }
+  .src-netease { border-top: 3px solid #EC4141; }
+  .src-netease .chip { background: #EC4141; color: #fff; }
+  .src-soundcloud { border-top: 3px solid #FF5500; }
+  .src-soundcloud .chip { background: #FF5500; color: #fff; }
+  .src-bilibili { border-top: 3px solid #fb7299; }
+  .src-bilibili .chip { background: #fb7299; color: #fff; }
+  .src-youtube { border-top: 3px solid #ff0000; }
+  .src-youtube .chip { background: #ff0000; color: #fff; }
+  .src-bandcamp { border-top: 3px solid #1da0c3; }
+  .src-bandcamp .chip { background: #1da0c3; color: #fff; }
+  .src .cur { display: none; background: #3a2f14; color: #ffd97a; }
+  .src.active .cur { display: inline-block; }
+  .src-spotify.active { border-color: #1DB954; box-shadow: 0 0 16px rgba(29,185,84,.28); }
+  .src-media.active { border-color: #5b9cf6; box-shadow: 0 0 16px rgba(91,156,246,.28); }
+  .src-netease.active { border-color: #EC4141; box-shadow: 0 0 16px rgba(236,65,65,.3); }
+  .src-soundcloud.active { border-color: #FF5500; box-shadow: 0 0 16px rgba(255,85,0,.3); }
+  .src-bilibili.active { border-color: #fb7299; box-shadow: 0 0 16px rgba(251,114,153,.3); }
+  .src-youtube.active { border-color: #ff0000; box-shadow: 0 0 16px rgba(255,0,0,.35); }
+  .src-bandcamp.active { border-color: #1da0c3; box-shadow: 0 0 16px rgba(29,160,195,.35); }
+  hr.divider { border: 0; border-top: 1px solid #2a2440; margin: 12px 0; }
+  .lab { font-size: 12px; color: #9a8fb8; margin-bottom: 7px; }
+  .mode-btn { padding: 6px 12px; font-size: 12px; border-radius: 6px; background: #262137; border: 1px solid #3c3458; color: #b8b0cf; cursor: pointer; transition: all .15s; }
+  .mode-btn:hover { background: #342c4c; color: #fff; }
+  .mode-btn.active { background: #6441a5; border-color: #9b72cf; color: #fff; font-weight: bold; box-shadow: 0 0 10px rgba(155,114,207,.4); }
+  .mode-btn:disabled { opacity: .35; cursor: not-allowed; background: #1c1829; border-color: #2a2440; color: #6d6682; box-shadow: none; pointer-events: none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>JAM 控制台</h1>
+  <div class="sub">radio.example.com · 网页管理 (CLI 等价物)</div>
+
+  <!-- 状态 -->
+  <div class="card" id="statusCard">
+    <h2>当前状态</h2>
+    <div class="status-line" id="stSource">—</div>
+    <div class="status-line" id="stTrack">—</div>
+    <div class="dim" id="stMeta">—</div>
+    <div class="dim" id="stLastCmd"></div>
+    <div class="row" style="margin-top:10px; align-items:center; flex-wrap:wrap; gap:8px;">
+      <button id="skipBtn" data-cmd="skip">⏭ 播放下一首</button>
+      <span style="font-size:13px; color:#9a8fb8; margin-left:6px;">播放模式:</span>
+      <div id="modeGroup" style="display:inline-flex; gap:6px;">
+        <button type="button" class="mode-btn" data-mode="repeat" title="当前单曲无限循环">🔂 单曲</button>
+        <button type="button" class="mode-btn" data-mode="loop" title="列表循环 (播完后回绕第一首无限循环)">🔁 循环</button>
+        <button type="button" class="mode-btn" data-mode="seq" title="顺序播放 (播完列表最后一首后结束并回落)">▶ 顺序</button>
+        <button type="button" class="mode-btn" data-mode="shuffle" title="打乱列表随机循环">🔀 随机</button>
+      </div>
+    </div>
+    <div class="row" style="margin-top:10px; align-items:center; flex-wrap:wrap; gap:8px;">
+      <label class="inline" style="font-size:13px;">从指定时点播放:
+        <input type="text" id="seekInput" placeholder="如 01:30 或 90" style="width:130px; padding:6px 10px; font-size:13px;">
+      </label>
+      <button type="button" id="seekBtn" class="primary" style="padding:6px 14px; font-size:13px;">▶ 从指定时点开始播放</button>
+      <span class="dim" style="font-size:12px;">支持分秒 (如 01:30) 或纯秒数 (如 90)</span>
+    </div>
+    <div class="row" id="svcRow"></div>
+  </div>
+
+  <!-- 音频放大器 (服务端总线增益) -->
+  <div class="card" id="ampCard">
+    <h2>🔊 音频放大器 (服务端总线增益)</h2>
+    <div class="dim" style="margin-bottom:10px">
+      服务端平滑放大广播输出音量（动态生效无需断流，内置专业防破音限幅）。当前放大倍数：<b id="curAmpVal" style="color:#ffd97a;font-size:14px">1.0x</b>
+    </div>
+    <div class="lab">快速可选倍数</div>
+    <div class="row" id="ampPresets" style="margin-top:0; margin-bottom:12px">
+      <button type="button" class="amp-btn" data-vol="1.0">1.0x (原始)</button>
+      <button type="button" class="amp-btn" data-vol="1.25">1.25x</button>
+      <button type="button" class="amp-btn" data-vol="1.5">1.5x</button>
+      <button type="button" class="amp-btn" data-vol="1.75">1.75x</button>
+      <button type="button" class="amp-btn" data-vol="2.0">2.0x</button>
+      <button type="button" class="amp-btn" data-vol="2.5">2.5x</button>
+      <button type="button" class="amp-btn" data-vol="3.0">3.0x</button>
+    </div>
+    <div class="lab">手动输入倍数 (&gt; 1)</div>
+    <div class="row" style="margin-top:0; align-items:center;">
+      <label class="inline">倍数:
+        <input type="number" id="customAmpInput" min="1.0" max="10.0" step="0.1" placeholder="如 1.8" style="width:100px">
+      </label>
+      <button type="button" class="primary" id="applyAmpBtn">应用</button>
+      <span class="dim" style="margin-left:6px; font-size:12px">建议 1.0x ~ 3.0x</span>
+    </div>
+  </div>
+
+  <!-- 音源: 三个子模块 (Spotify / VPS 媒体库 / 网易云), 当前活跃的高亮 -->
+  <div class="card">
+    <h2>音源</h2>
+    <div class="src-grid">
+
+      <div class="src src-spotify" id="srcSpotify">
+        <h3><span class="chip">♪</span> Spotify <span class="badge cur">当前</span></h3>
+        <div class="row" style="margin-top:0">
+          <button data-cmd="spotify">切换到 Spotify</button>
+        </div>
+        <hr class="divider">
+        <div class="lab">手机/电脑 Spotify 里选设备 "VPS Radio" 放歌, 全站同步收听</div>
+      </div>
+
+      <div class="src src-media" id="srcMedia">
+        <h3><span class="chip">▶</span> VPS 媒体库 <span class="badge cur">当前</span></h3>
+        <div class="row" style="margin-top:0">
+          <button data-cmd="folder" data-args='["/var/lib/radiod/media","shuffle"]'>整库随机</button>
+          <button data-cmd="folder" data-args='["/var/lib/radiod/media","seq"]'>按名顺序</button>
+        </div>
+        <hr class="divider">
+        <div class="lab">点击文件播放单曲 (上传仍走 scp → RUNBOOK §4)</div>
+        <div class="row" style="margin-top:6px; margin-bottom:8px; align-items:center; gap:8px;">
+          <label class="inline" style="font-size:13px;">起始时点:
+            <input type="text" id="libStartTime" placeholder="如 01:30 (选填)" style="width:130px; padding:5px 8px; font-size:12.5px;">
+          </label>
+          <span class="dim" style="font-size:12px">选填，点击曲目 ▶ 时将从此时点起播</span>
+        </div>
+        <div class="list" id="libList"><div class="dim">加载中…</div></div>
+      </div>
+
+      <div class="src src-netease" id="srcNetease">
+        <h3><span class="chip">云</span> 网易云 <span class="badge cur">当前</span></h3>
+        <div class="row" style="margin-top:0">
+          <button data-cmd="netease-fm">私人FM</button>
+          <button data-cmd="netease-daily">每日推荐</button>
+        </div>
+        <hr class="divider">
+        <div class="lab">单曲 / 歌单 / 专辑 / 播客 (支持直接粘贴数字 ID、完整链接或 App 分享文字)</div>
+        <div class="row">
+          <label class="inline">单曲 <input type="text" id="songId" placeholder="ID / 链接 / 分享文字" style="width:200px"></label>
+          <select id="songOrder"><option value="repeat">单曲</option><option value="loop">循环</option><option value="seq">顺序</option></select>
+          <button data-cmd="netease-song" data-args-from="song">播放</button>
+        </div>
+        <div class="row">
+          <label class="inline">歌单 <input type="text" id="plId" placeholder="ID / 链接 / 分享文字" style="width:200px"></label>
+          <select id="plOrder"><option value="loop">循环</option><option value="seq">顺序</option><option value="shuffle">随机</option><option value="repeat">单曲</option></select>
+          <button data-cmd="netease-playlist" data-args-from="pl">播放</button>
+        </div>
+        <div class="row">
+          <label class="inline">专辑 <input type="text" id="alId" placeholder="ID / 链接 / 分享文字" style="width:200px"></label>
+          <select id="alOrder"><option value="loop">循环</option><option value="seq">顺序</option><option value="shuffle">随机</option><option value="repeat">单曲</option></select>
+          <button data-cmd="netease-album" data-args-from="al">播放</button>
+        </div>
+        <div class="row">
+          <label class="inline">播客 <input type="text" id="podId" placeholder="ID / 链接 / 分享文字" style="width:200px"></label>
+          <select id="podOrder"><option value="seq">顺序</option><option value="loop">循环</option><option value="shuffle">随机</option><option value="repeat">单曲</option></select>
+          <button data-cmd="netease-podcast" data-args-from="pod">播放</button>
+        </div>
+        <hr class="divider">
+        <div class="lab">搜索点播 (单曲 / 播客)</div>
+        <div style="display:flex; gap:8px;">
+          <input type="text" id="nq" placeholder="歌名 / 歌手 / 播客关键词…" style="flex:1">
+          <button id="nSearch">搜单曲</button>
+          <button id="nPodSearch">搜播客</button>
+        </div>
+        <pre class="out" id="nResult" style="display:none"></pre>
+        <div class="row" id="nPlayRow" style="display:none">
+          <input type="number" id="nIdx" placeholder="序号" min="1" style="width:80px">
+          <select id="nPlayOrder"><option value="repeat">单曲</option><option value="loop">循环</option><option value="seq">顺序</option><option value="shuffle">随机</option></select>
+          <select id="nPodPlayOrder" style="display:none"><option value="seq">顺序</option><option value="loop">循环</option><option value="shuffle">随机</option><option value="repeat">单曲</option></select>
+          <button class="primary" id="nPlay">播放该曲</button>
+        </div>
+        <hr class="divider">
+        <div class="lab">登录 (cookie ~15 天过期后在此重扫)</div>
+        <div id="ntStatus" class="dim">检查中…</div>
+        <div class="row">
+          <button id="ntLogin">生成扫码二维码</button>
+        </div>
+        <div class="qrbox" id="qrBox" style="display:none">
+          <img id="qrImg" alt="登录二维码">
+          <div class="dim" id="qrState" style="margin-top:8px">等待扫码…</div>
+        </div>
+      </div>
+
+      <div class="src src-soundcloud" id="srcSoundcloud">
+        <h3><span class="chip">≈</span> SoundCloud <span class="badge cur">当前</span></h3>
+        <div class="row" style="margin-top:0">
+          <label class="inline">单曲 <input type="text" id="scTrackUrl" placeholder="单曲页面 URL 或纯数字 ID" style="width:200px"></label>
+          <select id="scTrackOrder"><option value="repeat">单曲</option><option value="loop">循环</option><option value="seq">顺序</option></select>
+          <button data-cmd="soundcloud-track" data-args-from="scTrack">播放</button>
+        </div>
+        <div class="row">
+          <label class="inline">Likes <input type="text" id="scLikesUser" value="plusdrei" placeholder="用户名或主页链接" style="width:130px"></label>
+          <select id="scLikesOrder"><option value="loop">循环</option><option value="seq">顺序</option><option value="shuffle">随机</option><option value="repeat">单曲</option></select>
+          <button data-cmd="soundcloud-likes" data-args-from="scLikes">播放</button>
+        </div>
+        <div class="row">
+          <label class="inline">歌单 <input type="text" id="scPlId" placeholder="ID 或 歌单完整链接" style="width:200px"></label>
+          <select id="scPlOrder"><option value="loop">循环</option><option value="seq">顺序</option><option value="shuffle">随机</option><option value="repeat">单曲</option></select>
+          <button data-cmd="soundcloud-playlist" data-args-from="scPl">播放</button>
+        </div>
+        <hr class="divider">
+        <div class="lab">搜索点歌 (免费匿名音源, 无需登录; ✂=30s试听自动跳过)</div>
+        <div class="grid2">
+          <input type="text" id="scq" placeholder="歌名 / 歌手 / DJ set…" style="width:100%">
+          <button id="scSearch">搜索</button>
+        </div>
+        <pre class="out" id="scResult" style="display:none"></pre>
+        <div class="row" id="scPlayRow" style="display:none">
+          <input type="number" id="scIdx" placeholder="序号" min="1" style="width:80px">
+          <select id="scPlayOrder"><option value="repeat">单曲</option><option value="loop">循环</option><option value="seq">顺序</option><option value="shuffle">随机</option></select>
+          <button class="primary" id="scPlay">播放该曲</button>
+        </div>
+        <hr class="divider">
+        <div class="lab">音源健康 (匿名 client_id 状态, 失效会自动刮站自愈)</div>
+        <div id="scStatus" class="dim">检查中…</div>
+      </div>
+
+      <div class="src src-bilibili" id="srcBilibili">
+        <h3><span class="chip">哔</span> 哔哩哔哩 <span class="badge cur">当前</span></h3>
+        <div class="lab">视频 / 收藏夹 / 合集 (支持完整 URL 或 ID，如 BV1GJ411x7h7、ml14092、sid 946974)</div>
+        <div class="row">
+          <label class="inline">视频 <input type="text" id="biliVideoUrl" placeholder="BV号 / 完整链接 / b23.tv" style="width:200px"></label>
+          <select id="biliVideoOrder"><option value="repeat">单曲</option><option value="loop">循环</option><option value="seq">顺序</option></select>
+          <button data-cmd="bilibili-video" data-args-from="biliVideo">播放</button>
+        </div>
+        <div class="row">
+          <label class="inline">收藏 <input type="text" id="biliFavId" placeholder="ml收藏夹ID 或 链接" style="width:200px"></label>
+          <select id="biliFavOrder"><option value="loop">循环</option><option value="seq">顺序</option><option value="shuffle">随机</option><option value="repeat">单曲</option></select>
+          <button data-cmd="bilibili-fav" data-args-from="biliFav">播放</button>
+        </div>
+        <div class="row">
+          <label class="inline">合集 <input type="text" id="biliSeasonUrl" placeholder="合集 / 系列链接 或 sid" style="width:200px"></label>
+          <select id="biliSeasonOrder"><option value="loop">循环</option><option value="seq">顺序</option><option value="shuffle">随机</option><option value="repeat">单曲</option></select>
+          <button data-cmd="bilibili-season" data-args-from="biliSeason">播放</button>
+        </div>
+        <hr class="divider">
+        <div class="lab">搜索点播 (纯匿名免登录, 提取最高音质 DASH 音轨)</div>
+        <div class="grid2">
+          <input type="text" id="biliq" placeholder="视频标题 / UP主 / 关键词…" style="width:100%">
+          <button id="biliSearch">搜索</button>
+        </div>
+        <pre class="out" id="biliResult" style="display:none"></pre>
+        <div class="row" id="biliPlayRow" style="display:none">
+          <input type="number" id="biliIdx" placeholder="序号" min="1" style="width:80px">
+          <select id="biliPlayOrder"><option value="repeat">单曲</option><option value="loop">循环</option><option value="seq">顺序</option><option value="shuffle">随机</option></select>
+          <button class="primary" id="biliPlay">播放该视频</button>
+        </div>
+      </div>
+
+      <div class="src src-youtube" id="srcYoutube">
+        <h3><span class="chip">▶</span> YouTube <span class="badge cur">当前</span></h3>
+        <div class="lab">智能输入任意 YouTube 链接（单视频 / 歌单 / Shorts / 短链 youtu.be / 分享文案），自动识别类别点播</div>
+        <div class="row">
+          <input type="text" id="ytSmartUrl" placeholder="直接粘贴 YouTube 任意链接 或 ID" style="flex:1; min-width:220px">
+          <select id="ytSmartOrder">
+            <option value="loop">列表循环 (歌单默认)</option>
+            <option value="repeat">单曲循环 (单视频默认)</option>
+            <option value="shuffle">随机播放</option>
+            <option value="seq">顺序播放</option>
+          </select>
+          <button class="primary" data-cmd="youtube-smart" data-args-from="ytSmart">播放</button>
+        </div>
+        <hr class="divider">
+        <div class="lab">搜索点播 (基于 yt-dlp 直搜最高音质 Opus 纯音轨)</div>
+        <div class="grid2">
+          <input type="text" id="ytq" placeholder="视频标题 / 频道 / 关键词…" style="width:100%">
+          <button id="ytSearch">搜索</button>
+        </div>
+        <pre class="out" id="ytResult" style="display:none"></pre>
+        <div class="row" id="ytPlayRow" style="display:none">
+          <input type="number" id="ytIdx" placeholder="序号" min="1" style="width:80px">
+          <select id="ytPlayOrder"><option value="repeat">单曲</option><option value="loop">循环</option><option value="seq">顺序</option><option value="shuffle">随机</option></select>
+          <button class="primary" id="ytPlay">播放该视频</button>
+        </div>
+      </div>
+
+      <div class="src src-bandcamp" id="srcBandcamp">
+        <h3><span class="chip">BC</span> Bandcamp <span class="badge cur">当前</span></h3>
+        <div class="lab">智能输入任意 Bandcamp 链接（单曲 / 专辑 / 艺人主页全库 / 分享文案），自动识别类别点播</div>
+        <div class="row">
+          <input type="text" id="bcSmartUrl" placeholder="直接粘贴 Bandcamp 链接 (单曲 / 专辑 / 艺人)" style="flex:1; min-width:220px">
+          <select id="bcSmartOrder">
+            <option value="loop">列表循环 (专辑/全库默认)</option>
+            <option value="repeat">单曲循环 (单曲默认)</option>
+            <option value="shuffle">随机播放</option>
+            <option value="seq">顺序播放</option>
+          </select>
+          <button class="primary" data-cmd="bandcamp-smart" data-args-from="bcSmart">播放</button>
+        </div>
+        <hr class="divider">
+        <div class="lab">搜索点播 (单曲 / 专辑 / 艺人搜索点歌)</div>
+        <div class="grid2">
+          <input type="text" id="bcq" placeholder="曲名 / 专辑名 / 艺人…" style="width:100%">
+          <button id="bcSearch">搜索</button>
+        </div>
+        <pre class="out" id="bcResult" style="display:none"></pre>
+        <div class="row" id="bcPlayRow" style="display:none">
+          <input type="number" id="bcIdx" placeholder="序号" min="1" style="width:80px">
+          <select id="bcPlayOrder"><option value="loop">循环</option><option value="repeat">单曲</option><option value="seq">顺序</option><option value="shuffle">随机</option></select>
+          <button class="primary" id="bcPlay">播放该项</button>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+<div id="toast"></div>
+
+<script>
+"use strict";
+const $ = (s) => document.querySelector(s);
+const toastEl = $("#toast");
+let toastTimer = null;
+function toast(msg, isErr) {
+  toastEl.textContent = msg;
+  toastEl.className = "show" + (isErr ? " err" : "");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toastEl.className = "", 2400);
+}
+async function api(path, opts) {
+  const r = await fetch(path, opts ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(opts) } : undefined);
+  const j = await r.json().catch(() => ({ error: "bad response" }));
+  if (!r.ok) throw new Error(j.error || r.status);
+  return j;
+}
+async function cmd(cmd, args) {
+  try {
+    const r = await api("/admin/api/command", { cmd, args: args || [] });
+    toast("已发送 ✓ (" + r.sent.slice(0, 40) + "…)");
+    setTimeout(refreshStatus, 1500);
+  } catch (e) { toast("失败: " + e.message, true); }
+}
+
+// ---------- 状态 ----------
+const CTX_PRETTY = { "playlist:": "网易歌单 #", "album:": "网易专辑 #", "podcast:": "网易播客 #", "program:": "网易节目 #", "song:": "网易单曲 #", "fm": "私人FM", "daily": "每日推荐", "search": "搜索结果" };
+const SC_CTX_PRETTY = { "likes:": "Likes @", "playlist:": "SC歌单 #", "track:": "SC单曲 #", "search": "搜索点歌" };
+const BILI_CTX_PRETTY = { "video:": "B站视频 ", "fav:": "B站收藏夹 #", "season:": "B站合集 ", "search": "搜索点播" };
+const YT_CTX_PRETTY = { "video:": "YouTube 视频 #", "playlist:": "YouTube 歌单 #", "search": "搜索点播" };
+const BC_CTX_PRETTY = { "album:": "Bandcamp 专辑 #", "track:": "Bandcamp 单曲 #", "artist:": "Bandcamp 艺人 #", "search": "搜索点播" };
+const ORDER_PRETTY = { repeat: "🔂 单曲", loop: "🔁 循环", seq: "▶ 顺序", shuffle: "🔀 随机" };
+async function refreshStatus() {
+  try {
+    const s = await api("/admin/api/status");
+    const src = s.source;
+    if (src) {
+      const name = { spotify: "Spotify", file: "本地文件", folder: "文件夹", netease: "网易云", soundcloud: "SoundCloud", bilibili: "哔哩哔哩", youtube: "YouTube", bandcamp: "Bandcamp" }[src.name] || src.name;
+      const ctxMap = src.name === "soundcloud" ? SC_CTX_PRETTY : (src.name === "bilibili" ? BILI_CTX_PRETTY : (src.name === "youtube" ? YT_CTX_PRETTY : (src.name === "bandcamp" ? BC_CTX_PRETTY : CTX_PRETTY)));
+      let ctx = src.dir || "";
+      for (const [k, v] of Object.entries(ctxMap)) if (ctx.startsWith(k)) { ctx = v + ctx.slice(k.length); break; }
+      const isPlaylistSrc = (src.name === "netease" || src.name === "soundcloud" || src.name === "bilibili" || src.name === "youtube" || src.name === "bandcamp");
+      $("#stSource").innerHTML = `音源: <b>${name}</b>` + (src.dir && isPlaylistSrc ? ` — ${ctx}` : "");
+      let track = "—";
+      if (isPlaylistSrc && src.file) track = src.file.split(" ").slice(1).join(" ") || src.file.split(" ")[0];
+      else if (src.file) track = src.file.split("/").pop();
+      else if (src.name === "spotify") track = "(手机 Spotify 里选 \"VPS Radio\" 放歌)";
+      const ordTxt = ORDER_PRETTY[src.order] || src.order;
+      $("#stTrack").textContent = src.total > 0 ? `曲目: ${track}  [${src.idx + 1}/${src.total} ${ordTxt}]` : `曲目: ${track}`;
+      const ago = s._now ? Math.max(0, Math.floor(s._now - src.ts)) : "?";
+      $("#stMeta").textContent = `更新于 ${ago}s 前`;
+      // 当前音源子模块高亮 ("当前" 徽章 + 品牌色边框)
+      const srcMap = { spotify: "srcSpotify", folder: "srcMedia", file: "srcMedia", netease: "srcNetease", soundcloud: "srcSoundcloud", bilibili: "srcBilibili", youtube: "srcYoutube", bandcamp: "srcBandcamp" };
+      document.querySelectorAll(".src").forEach((el) => el.classList.remove("active"));
+      const box = srcMap[src.name];
+      if (box) document.getElementById(box).classList.add("active");
+      // 高亮当前播放模式按钮 (Spotify 模式不支持播放模式切换，按钮置灰禁用)
+      const isSpotify = src.name === "spotify";
+      document.querySelectorAll(".mode-btn").forEach((btn) => {
+        if (!btn.dataset.tip) btn.dataset.tip = btn.title;
+        btn.disabled = isSpotify;
+        if (isSpotify) {
+          btn.classList.remove("active");
+          btn.title = "Spotify 模式由手机客户端控制播放模式";
+        } else {
+          btn.title = btn.dataset.tip;
+          if (btn.dataset.mode === src.order) btn.classList.add("active");
+          else btn.classList.remove("active");
+        }
+      });
+      // "播放下一首" 仅作用于服务端可控音源; Spotify 模式切歌归手机 Spotify Connect
+      const skipBtn = document.getElementById("skipBtn");
+      if (isSpotify) { skipBtn.disabled = true; skipBtn.title = "Spotify 模式请在手机 Spotify 里切歌"; }
+      else { skipBtn.disabled = false; skipBtn.title = src.name === "file" ? "单曲循环模式: 重播当前文件 (库里只有一首时表现为重播)" : ""; }
+      const seekBtn = document.getElementById("seekBtn");
+      const seekInput = document.getElementById("seekInput");
+      if (seekBtn && seekInput) {
+        if (isSpotify) {
+          seekBtn.disabled = true;
+          seekInput.disabled = true;
+          seekBtn.title = "Spotify 模式请在手机客户端拖动进度条";
+        } else {
+          seekBtn.disabled = false;
+          seekInput.disabled = false;
+          seekBtn.title = "";
+        }
+      }
+    }
+    $("#svcRow").innerHTML = ["radiod", "mediamtx", "caddy", "ncm-api"].map(
+      (k) => `<span class="badge ${s[k] ? "ok" : "bad"}">${k} ${s[k] ? "✓" : "✗"}</span>`
+    ).join("") + (s.netease_logged_in ? `<span class="badge ok">网易已登录</span>` : `<span class="badge bad">网易未登录</span>`);
+    if (typeof s.volume === "number") {
+      updateAmpUI(s.volume);
+    }
+    // 最近操作 (radiod cmd.result): 点播后 3s 轮询内可见 OK/FAIL 与原因; 10min 前的不再显示
+    const lc = s.last_cmd;
+    const lcAge = lc && s._now ? s._now - lc.ts : 1e9;
+    if (lc && lcAge <= 600) {
+      const age = lcAge < 60 ? `${Math.max(0, Math.floor(lcAge))}s` : `${Math.floor(lcAge / 60)}min`;
+      $("#stLastCmd").innerHTML = `最近操作 <span class="badge ${lc.status === "OK" ? "ok" : "bad"}">${lc.status}</span> (${age}前) ${lc.text.replace(/</g, "&lt;")}`;
+    } else $("#stLastCmd").textContent = "";
+  } catch (e) { $("#stSource").textContent = "状态获取失败: " + e.message; }
+}
+setInterval(refreshStatus, 3000);
+refreshStatus();
+
+// ---------- 音频放大器 ----------
+let currentVolume = 1.0;
+function updateAmpUI(vol) {
+  if (typeof vol === "number" && !isNaN(vol)) currentVolume = vol;
+  const displayVal = currentVolume.toFixed(2).replace(/\.?0+$/, "");
+  $("#curAmpVal").textContent = displayVal + "x";
+  document.querySelectorAll(".amp-btn").forEach(btn => {
+    const v = parseFloat(btn.getAttribute("data-vol"));
+    if (Math.abs(v - currentVolume) < 0.01) {
+      btn.classList.add("active");
+    } else {
+      btn.classList.remove("active");
+    }
+  });
+}
+
+async function setAmplifier(vol) {
+  if (typeof vol !== "number" || isNaN(vol) || vol < 0.1 || vol > 10.0) {
+    toast("请输入 0.1 ~ 10.0 之间的有效倍数", true);
+    return;
+  }
+  try {
+    const r = await api("/admin/api/volume", { volume: vol });
+    toast("放大倍数已调整为 " + r.volume + "x ✓");
+    updateAmpUI(r.volume);
+    if (r.warning) toast(r.warning, true);
+    setTimeout(refreshStatus, 1000);
+  } catch (e) {
+    toast("放大倍数设置失败: " + e.message, true);
+  }
+}
+
+document.querySelectorAll(".amp-btn").forEach(btn => {
+  btn.addEventListener("click", () => {
+    const v = parseFloat(btn.getAttribute("data-vol"));
+    setAmplifier(v);
+  });
+});
+
+$("#applyAmpBtn").addEventListener("click", () => {
+  const input = $("#customAmpInput");
+  const val = parseFloat(input.value);
+  if (isNaN(val) || val <= 0) {
+    toast("请输入有效倍数 (如 1.8)", true);
+    return;
+  }
+  setAmplifier(val);
+});
+
+
+// ---------- 命令按钮 ----------
+document.querySelectorAll("button[data-cmd]").forEach((b) => {
+  b.addEventListener("click", () => {
+    const c = b.dataset.cmd;
+    if (c === "netease-song") {
+      const id = $("#songId").value.trim();
+      if (!id) return toast("请输入网易云单曲 ID、链接或分享文字", true);
+      toast("正在解析并切换…");
+      cmd(c, [id, $("#songOrder").value]);
+    } else if (c === "netease-playlist") {
+      const id = $("#plId").value.trim();
+      if (!id) return toast("请输入网易云歌单 ID、链接或分享文字", true);
+      toast("正在解析并切换…");
+      cmd(c, [id, $("#plOrder").value]);
+    } else if (c === "netease-album") {
+      const id = $("#alId").value.trim();
+      if (!id) return toast("请输入网易云专辑 ID、链接或分享文字", true);
+      toast("正在解析并切换…");
+      cmd(c, [id, $("#alOrder").value]);
+    } else if (c === "netease-podcast") {
+      const id = $("#podId").value.trim();
+      if (!id) return toast("请输入网易云播客 ID、链接或分享文字", true);
+      toast("正在解析并切换…");
+      cmd(c, [id, $("#podOrder").value]);
+    } else if (c === "soundcloud-track") {
+      const id = $("#scTrackUrl").value.trim();
+      if (!id) return toast("请输入 SoundCloud 单曲 URL 或 ID", true);
+      toast("正在解析并切换…");
+      cmd(c, [id, $("#scTrackOrder").value]);
+    } else if (c === "soundcloud-likes") {
+      const u = $("#scLikesUser").value.trim();
+      if (!u) return toast("请输入 SoundCloud 用户名或主页链接", true);
+      cmd(c, [u, $("#scLikesOrder").value]);
+    } else if (c === "soundcloud-playlist") {
+      const id = $("#scPlId").value.trim();
+      if (!id) return toast("请输入 SoundCloud 歌单 ID 或完整链接", true);
+      toast("正在解析并切换…");
+      cmd(c, [id, $("#scPlOrder").value]);
+    } else if (c === "bilibili-video") {
+      const v = $("#biliVideoUrl").value.trim();
+      if (!v) return toast("请输入 B站视频 BV号、链接或 b23.tv", true);
+      toast("正在解析并切换…");
+      cmd(c, [v, $("#biliVideoOrder").value]);
+    } else if (c === "bilibili-fav") {
+      const id = $("#biliFavId").value.trim();
+      if (!id) return toast("请输入 B站收藏夹 ID 或链接", true);
+      toast("正在解析并切换…");
+      cmd(c, [id, $("#biliFavOrder").value]);
+    } else if (c === "bilibili-season") {
+      const u = $("#biliSeasonUrl").value.trim();
+      if (!u) return toast("请输入 B站合集或系列链接 / ID", true);
+      toast("正在解析并切换…");
+      cmd(c, [u, $("#biliSeasonOrder").value]);
+    } else if (c === "youtube-smart") {
+      const u = $("#ytSmartUrl").value.trim();
+      if (!u) return toast("请输入 YouTube 链接或 ID", true);
+      toast("正在智能解析并切换…");
+      cmd(c, [u, $("#ytSmartOrder").value]);
+    } else if (c === "bandcamp-smart") {
+      const u = $("#bcSmartUrl").value.trim();
+      if (!u) return toast("请输入 Bandcamp 链接", true);
+      toast("正在智能解析并切换…");
+      cmd(c, [u, $("#bcSmartOrder").value]);
+    } else if (b.dataset.args) {
+      cmd(c, JSON.parse(b.dataset.args));
+    } else {
+      cmd(c);
+    }
+  });
+});
+
+// ---------- 播放模式快速切换 ----------
+document.querySelectorAll(".mode-btn").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    if (btn.disabled) return;
+    cmd("mode", [btn.dataset.mode]);
+  });
+});
+
+// ---------- 从指定时点播放 ----------
+const doSeek = () => {
+  const input = $("#seekInput");
+  const val = input.value.trim();
+  if (!val) return toast("请输入指定时点 (如 01:30 或 90)", true);
+  // 简易格式预检
+  const isValid = /^\d+(\.\d+)?\s*s?$/i.test(val) ||
+                  /^(?:\d+:)?\d{1,2}:\d{1,2}(?:\.\d+)?$/.test(val) ||
+                  (/^(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+(?:\.\d+)?)\s*s)?$/i.test(val) && val.length > 1);
+  if (!isValid) return toast("时点格式不正确，支持 mm:ss、hh:mm:ss 或纯秒数 (如 01:30、90)", true);
+  toast("正在从 " + val + " 开始播放…");
+  cmd("seek", [val]);
+};
+$("#seekBtn").addEventListener("click", doSeek);
+$("#seekInput").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") doSeek();
+});
+
+// ---------- 媒体库 ----------
+async function refreshLib() {
+  try {
+    const l = await api("/admin/api/library");
+    const box = $("#libList");
+    if (!l.files.length) { box.innerHTML = `<div class="dim">媒体库空 (上传方法见 RUNBOOK §4)</div>`; return; }
+    box.innerHTML = "";
+    for (const f of l.files) {
+      const div = document.createElement("div");
+      div.className = "item";
+      const sz = f.size > 1048576 ? (f.size / 1048576).toFixed(1) + " MB" : Math.ceil(f.size / 1024) + " KB";
+      div.innerHTML = `<span class="nm" title="${f.path}" style="cursor:pointer">${f.name}</span><span>${sz} <button>▶</button></span>`;
+      const playFile = () => {
+        const ss = $("#libStartTime").value.trim();
+        if (ss) {
+          toast("正在从 " + ss + " 开始播放…");
+          cmd("file", [f.path, ss]);
+        } else {
+          cmd("file", [f.path]);
+        }
+      };
+      div.querySelector("button").addEventListener("click", playFile);
+      div.querySelector(".nm").addEventListener("click", playFile);
+      box.appendChild(div);
+    }
+  } catch (e) { $("#libList").innerHTML = `<div class="dim">读取失败: ${e.message}</div>`; }
+}
+refreshLib();
+
+// ---------- 网易搜索 ----------
+let nSearchMode = "song";
+
+$("#nSearch").addEventListener("click", async () => {
+  const q = $("#nq").value.trim();
+  if (!q) return;
+  nSearchMode = "song";
+  $("#nPlayOrder").style.display = "inline-block";
+  $("#nPodPlayOrder").style.display = "none";
+  $("#nPlay").textContent = "播放该曲";
+  $("#nResult").style.display = "block";
+  $("#nResult").textContent = "搜索单曲中…";
+  try {
+    const r = await api("/admin/api/netease-search", { q });
+    $("#nResult").textContent = r.output;
+    $("#nPlayRow").style.display = "flex";
+  } catch (e) { $("#nResult").textContent = "失败: " + e.message; }
+});
+
+$("#nPodSearch").addEventListener("click", async () => {
+  const q = $("#nq").value.trim();
+  if (!q) return;
+  nSearchMode = "podcast";
+  $("#nPlayOrder").style.display = "none";
+  $("#nPodPlayOrder").style.display = "inline-block";
+  $("#nPlay").textContent = "播放该播客";
+  $("#nResult").style.display = "block";
+  $("#nResult").textContent = "搜索播客中…";
+  try {
+    const r = await api("/admin/api/netease-podcast-search", { q });
+    $("#nResult").textContent = r.output;
+    $("#nPlayRow").style.display = "flex";
+  } catch (e) { $("#nResult").textContent = "失败: " + e.message; }
+});
+
+$("#nPlay").addEventListener("click", () => {
+  const n = $("#nIdx").value.trim();
+  if (!/^\d+$/.test(n) || +n < 1) return toast("序号要正整数", true);
+  if (nSearchMode === "podcast") {
+    cmd("netease-podcast-play", [String(+n - 1), $("#nPodPlayOrder").value]);
+  } else {
+    cmd("netease-play", [String(+n - 1), $("#nPlayOrder").value]);
+  }
+});
+
+// ---------- SoundCloud 搜索 ----------
+$("#scSearch").addEventListener("click", async () => {
+  const q = $("#scq").value.trim();
+  if (!q) return;
+  $("#scResult").style.display = "block";
+  $("#scResult").textContent = "搜索中…";
+  try {
+    const r = await api("/admin/api/soundcloud-search", { q });
+    $("#scResult").textContent = r.output;
+    $("#scPlayRow").style.display = "flex";
+  } catch (e) { $("#scResult").textContent = "失败: " + e.message; }
+});
+$("#scPlay").addEventListener("click", () => {
+  const n = $("#scIdx").value.trim();
+  if (!/^\d+$/.test(n) || +n < 1) return toast("序号要正整数", true);
+  cmd("soundcloud-play", [String(+n - 1), $("#scPlayOrder").value]);
+});
+
+// ---------- 哔哩哔哩 搜索 ----------
+$("#biliSearch").addEventListener("click", async () => {
+  const q = $("#biliq").value.trim();
+  if (!q) return;
+  $("#biliResult").style.display = "block";
+  $("#biliResult").textContent = "搜索中…";
+  try {
+    const r = await api("/admin/api/bilibili-search", { q });
+    $("#biliResult").textContent = r.output;
+    $("#biliPlayRow").style.display = "flex";
+  } catch (e) { $("#biliResult").textContent = "失败: " + e.message; }
+});
+$("#biliPlay").addEventListener("click", () => {
+  const n = $("#biliIdx").value.trim();
+  if (!/^\d+$/.test(n) || +n < 1) return toast("序号要正整数", true);
+  cmd("bilibili-play", [String(+n - 1), $("#biliPlayOrder").value]);
+});
+
+// ---------- YouTube 搜索 ----------
+$("#ytSearch").addEventListener("click", async () => {
+  const q = $("#ytq").value.trim();
+  if (!q) return;
+  $("#ytResult").style.display = "block";
+  $("#ytResult").textContent = "搜索中…";
+  try {
+    const r = await api("/admin/api/youtube-search", { q });
+    $("#ytResult").textContent = r.output;
+    $("#ytPlayRow").style.display = "flex";
+  } catch (e) { $("#ytResult").textContent = "失败: " + e.message; }
+});
+$("#ytPlay").addEventListener("click", () => {
+  const n = $("#ytIdx").value.trim();
+  if (!/^\d+$/.test(n) || +n < 1) return toast("序号要正整数", true);
+  cmd("youtube-play", [String(+n - 1), $("#ytPlayOrder").value]);
+});
+
+// ---------- Bandcamp 搜索 ----------
+$("#bcSearch").addEventListener("click", async () => {
+  const q = $("#bcq").value.trim();
+  if (!q) return;
+  $("#bcResult").style.display = "block";
+  $("#bcResult").textContent = "搜索中…";
+  try {
+    const r = await api("/admin/api/bandcamp-search", { q });
+    $("#bcResult").textContent = r.output;
+    $("#bcPlayRow").style.display = "flex";
+  } catch (e) { $("#bcResult").textContent = "失败: " + e.message; }
+});
+$("#bcPlay").addEventListener("click", () => {
+  const n = $("#bcIdx").value.trim();
+  if (!/^\d+$/.test(n) || +n < 1) return toast("序号要正整数", true);
+  cmd("bandcamp-play", [String(+n - 1), $("#bcPlayOrder").value]);
+});
+
+// ---------- SoundCloud 音源健康 ----------
+async function refreshSc() {
+  try {
+    const s = await api("/admin/api/soundcloud-status");
+    $("#scStatus").innerHTML = s.output + (s.healthy ? ' <span class="badge ok">健康</span>' : ' <span class="badge bad">异常</span>');
+  } catch (e) { $("#scStatus").textContent = "查询失败: " + e.message; }
+}
+refreshSc();
+setInterval(refreshSc, 60000);
+
+// ---------- 网易登录 ----------
+let qrTimer = null, qrKey = null;
+async function refreshNt() {
+  try {
+    const s = await api("/admin/api/netease-status");
+    $("#ntStatus").innerHTML = s.output + (s.logged_in ? ' <span class="badge ok">有效</span>' : ' <span class="badge bad">失效</span>');
+  } catch (e) { $("#ntStatus").textContent = "查询失败: " + e.message; }
+}
+refreshNt();
+
+$("#ntLogin").addEventListener("click", async () => {
+  try {
+    const r = await fetch("/admin/api/netease-login-qr");
+    if (!r.ok) throw new Error((await r.json()).error || r.status);
+    const b = new Blob([await r.arrayBuffer()], { type: "image/png" });
+    $("#qrImg").src = URL.createObjectURL(b);
+    $("#qrBox").style.display = "block";
+    $("#qrState").textContent = "等待扫码… (二维码 ~5 分钟有效)";
+    // key 从响应头取 (helper login-qr-url 的第一行)
+    qrKey = r.headers.get("X-QR-Key");
+    startPoll();
+  } catch (e) { toast("出码失败: " + e.message, true); }
+});
+
+function startPoll() {
+  clearInterval(qrTimer);
+  qrTimer = setInterval(async () => {
+    if (!qrKey) return clearInterval(qrTimer);
+    try {
+      const r = await fetch("/admin/api/netease-login-check?key=" + encodeURIComponent(qrKey));
+      const j = await r.json();
+      if (j.code === 803 || j.status === "ok") {
+        clearInterval(qrTimer); qrKey = null;
+        $("#qrState").textContent = "登录成功 ✓ cookie 已更新";
+        refreshNt(); refreshStatus();
+      } else if (j.code === 802) {
+        $("#qrState").textContent = "已扫码, 请在手机上点确认";
+      } else if (j.code === 800 || j.code === "EXPIRED") {
+        clearInterval(qrTimer); qrKey = null;
+        $("#qrState").textContent = "二维码过期, 重新生成";
+      } else if (j.code === 801) {
+        // 继续等
+      } else if (r.status === 401) {
+        clearInterval(qrTimer); qrKey = null;
+      }
+    } catch {}
+  }, 2500);
+}
+</script>
+</body>
+</html>

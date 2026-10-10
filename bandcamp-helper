@@ -1,0 +1,520 @@
+#!/usr/bin/env python3
+"""
+bandcamp-helper — VPS Radio Bandcamp 音源辅助工具
+实现:
+  - 智能 URL/文案解析 (单曲 / 专辑 / 艺人全库 / 手机分享长文本)
+  - 通过 Bandcamp 数据与 API 提取 128kbps MP3 纯音频直链与曲目列表
+  - 单曲、专辑与艺人多专辑列表展开 (支持多线程极速并发拉取)
+  - 关键词搜索与原子缓存 (/run/radiod/bandcamp_search.cache, 0666)
+  - ffmpeg 直推 s16le 44100Hz 双声道 PCM 进入 /run/radiod/audio.fifo
+  - 退出码语义: 0 成功 / 22 曲目不可播(仅付费试听受限) / 23 网络/解析错误 / 24 参数错误
+"""
+import os
+import sys
+import re
+import json
+import time
+import signal
+import html as html_mod
+import subprocess
+import urllib.parse
+import urllib.request
+import urllib.error
+from concurrent.futures import ThreadPoolExecutor
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+AUDIO_FIFO = "/run/radiod/audio.fifo"
+SEARCH_CACHE = "/run/radiod/bandcamp_search.cache"
+DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+HTTP_TIMEOUT = 12
+
+
+def log(msg: str):
+    sys.stderr.write(f"bandcamp-helper: {msg}\n")
+    sys.stderr.flush()
+
+
+def die(msg: str, code: int = 23):
+    log(f"错误: {msg}")
+    sys.exit(code)
+
+
+def clean_title(s: str, default: str = "") -> str:
+    """清洗标题中的 HTML 实体、标签、竖线、换行符，保护状态文件与面板显示。"""
+    if not s or s == "None":
+        return default
+    s = html_mod.unescape(s)
+    s = re.sub(r"<[^>]+>", "", s)
+    s = s.replace("|", "／").replace("\r", " ").replace("\n", " ")
+    res = re.sub(r"\s+", " ", s).strip()
+    return res if res else default
+
+
+def extract_url(text: str) -> str:
+    """从可能包含前缀文案的长文本中提取首个 http(s) 链接。"""
+    text = text.strip()
+    m = re.search(r"https?://[^\s)）'\"<>]+", text)
+    if m:
+        return m.group(0)
+    return text
+
+
+def clean_bandcamp_url(url: str) -> str:
+    """修复 Bandcamp API 或移动端分享产生的重复域名问题。"""
+    if not url:
+        return ""
+    url = url.strip().strip("'\"")
+    idx = url.rfind("https://")
+    if idx <= 0:
+        idx = url.rfind("http://")
+    if idx > 0:
+        url = url[idx:]
+    return url.strip()
+
+
+def parse_bandcamp_input(raw: str) -> tuple[str, str]:
+    """
+    智能解析用户输入。
+    返回: (type, clean_url)
+      type 为 'track' | 'album' | 'artist'
+      clean_url 为规范化的 URL
+    """
+    raw = raw.strip().strip("'\"")
+    url = clean_bandcamp_url(extract_url(raw))
+
+    if not (url.startswith("http://") or url.startswith("https://")):
+        if "bandcamp.com" in raw:
+            url = clean_bandcamp_url(f"https://{raw.lstrip('/')}")
+        else:
+            return "search", raw
+
+    parsed = urllib.parse.urlparse(url)
+    path = parsed.path.rstrip("/")
+
+    if "/track/" in path:
+        return "track", url
+    elif "/album/" in path:
+        return "album", url
+    else:
+        # 艺人主页或 /music
+        return "artist", url
+
+
+def fetch_html(url: str) -> str:
+    """拉取网页 HTML。"""
+    clean_u = clean_bandcamp_url(url)
+    req = urllib.request.Request(
+        clean_u,
+        headers={
+            "User-Agent": DEFAULT_UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        die(f"HTTP 请求失败 ({e.code}): {clean_u}", 23)
+    except Exception as e:
+        die(f"网络请求失败: {e}", 23)
+
+
+def parse_page_tralbum(url: str, page_html: str = "") -> dict:
+    """从页面 HTML 提取 data-tralbum 或 TralbumData 数据字典。"""
+    if not page_html:
+        page_html = fetch_html(url)
+
+    m_tr = re.search(r'data-tralbum="([^"]+)"', page_html)
+    if m_tr:
+        try:
+            return json.loads(html_mod.unescape(m_tr.group(1)))
+        except Exception:
+            pass
+
+    m_js = re.search(r'var\s+TralbumData\s*=\s*(\{.*?\});\s*(?:var|\n|</script>)', page_html, re.DOTALL)
+    if m_js:
+        try:
+            return json.loads(m_js.group(1))
+        except Exception:
+            pass
+
+    return {}
+
+
+# ── CLI 子命令实现 ─────────────────────────────────────────────────────────
+
+def cmd_resolve(args: list[str]):
+    """解析输入，输出 JSON 结构。"""
+    if not args:
+        die("用法: bandcamp-helper resolve <链接/文案>", 24)
+    raw = " ".join(args).strip()
+    kind, val = parse_bandcamp_input(raw)
+    result = {"type": kind, "url": val, "raw": raw}
+    print(json.dumps(result, ensure_ascii=False))
+
+
+def cmd_list_track(args: list[str]):
+    """输出单曲信息: '<track_url> <artist> - <title>'"""
+    if not args:
+        die("用法: bandcamp-helper list track <链接/文案>", 24)
+    raw = " ".join(args).strip()
+    _, target_url = parse_bandcamp_input(raw)
+
+    data = parse_page_tralbum(target_url)
+    if not data:
+        die("未能从页面解析出曲目信息", 22)
+
+    artist = clean_title(data.get("artist"), default="Bandcamp")
+    trackinfo = data.get("trackinfo", [])
+    if not trackinfo:
+        die("该页面未包含任何曲目", 22)
+
+    t0 = trackinfo[0]
+    file_info = t0.get("file")
+    if not (file_info and isinstance(file_info, dict) and file_info.get("mp3-128")):
+        die(f"曲目 '{t0.get('title')}' 无可播放音频流 (可能仅供购买下载)", 22)
+
+    title = clean_title(t0.get("title") or data.get("current", {}).get("title"), default="未知曲目")
+    print(f"{target_url} {artist} - {title}")
+
+
+def cmd_list_album(args: list[str]):
+    """批量输出专辑曲目列表: 每行 '<track_url> <artist> - <title>' (自动过滤不可播)"""
+    if not args:
+        die("用法: bandcamp-helper list album <链接/文案>", 24)
+    raw = " ".join(args).strip()
+    _, target_url = parse_bandcamp_input(raw)
+
+    data = parse_page_tralbum(target_url)
+    if not data:
+        die("未能从页面解析出专辑信息", 22)
+
+    artist = clean_title(data.get("artist"), default="Bandcamp")
+    album_title = clean_title(data.get("current", {}).get("title"), default="")
+    trackinfo = data.get("trackinfo", [])
+
+    valid_count = 0
+    for idx, t in enumerate(trackinfo, 1):
+        file_info = t.get("file")
+        if not (file_info and isinstance(file_info, dict) and file_info.get("mp3-128")):
+            continue
+
+        rel_link = t.get("title_link")
+        if rel_link:
+            t_url = urllib.parse.urljoin(target_url, rel_link)
+        else:
+            t_url = f"{target_url}#t{t.get('track_num', idx)}"
+
+        track_title = clean_title(t.get("title"), default=f"曲目 {idx}")
+        print(f"{t_url} {artist} - {track_title}")
+        valid_count += 1
+
+    if valid_count == 0:
+        die(f"专辑 '{album_title}' 中未找到可供试听的曲目", 22)
+
+
+def cmd_list_artist(args: list[str]):
+    """展开艺人全库/作品集: 抓取 /music 列表并并发提取全部可播放单曲。"""
+    if not args:
+        die("用法: bandcamp-helper list artist <艺人主页/链接>", 24)
+    raw = " ".join(args).strip()
+    _, artist_url = parse_bandcamp_input(raw)
+
+    music_url = artist_url.rstrip("/")
+    if not music_url.endswith("/music"):
+        music_url += "/music"
+
+    html = fetch_html(music_url)
+    grid_pattern = re.compile(
+        r'<a\s+href="(/album/[^"?#]+|/track/[^"?#]+)"[^>]*>.*?<p\s+class="title"[^>]*>\s*(.*?)\s*</p>',
+        re.DOTALL,
+    )
+    matches = grid_pattern.findall(html)
+    if not matches:
+        data = parse_page_tralbum(artist_url, html)
+        if data and data.get("trackinfo"):
+            return cmd_list_album([artist_url])
+        die(f"未在艺人主页找到任何公开发行的作品: {artist_url}", 22)
+
+    release_urls = [urllib.parse.urljoin(artist_url, rel) for rel, _ in matches]
+
+    def fetch_release_tracks(u: str) -> list[tuple[str, str]]:
+        tracks = []
+        try:
+            d = parse_page_tralbum(u)
+            if not d:
+                return tracks
+            art = clean_title(d.get("artist"), default="Bandcamp")
+            tinfo = d.get("trackinfo", [])
+            for i, t in enumerate(tinfo, 1):
+                f = t.get("file")
+                if not (f and isinstance(f, dict) and f.get("mp3-128")):
+                    continue
+                rel_l = t.get("title_link")
+                if rel_l:
+                    tu = urllib.parse.urljoin(u, rel_l)
+                else:
+                    tu = f"{u}#t{t.get('track_num', i)}"
+                tt = clean_title(t.get("title"), default=f"曲目 {i}")
+                tracks.append((tu, f"{art} - {tt}"))
+        except Exception:
+            pass
+        return tracks
+
+    all_tracks = []
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for release_tracks in ex.map(fetch_release_tracks, release_urls):
+            all_tracks.extend(release_tracks)
+
+    if not all_tracks:
+        die(f"艺人发布的作品中无可供播出的曲目: {artist_url}", 22)
+
+    for tu, tt in all_tracks:
+        print(f"{tu} {tt}")
+
+
+def cmd_search(args: list[str]):
+    """关键词搜索，输出编号列表并写入 /run/radiod/bandcamp_search.cache (0666)"""
+    if not args:
+        die("用法: bandcamp-helper search <关键词...>", 24)
+    query = " ".join(args).strip()
+
+    search_url = "https://bandcamp.com/api/fuzzysearch/1/app_autocomplete?q=" + urllib.parse.quote(query)
+    req = urllib.request.Request(
+        search_url,
+        headers={
+            "User-Agent": DEFAULT_UA,
+            "Accept": "application/json",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        die(f"搜索 Bandcamp 失败: {e}", 23)
+
+    raw_results = data.get("results", [])
+    if not raw_results:
+        die(f"未找到关于 '{query}' 的 Bandcamp 结果", 22)
+
+    type_map = {"a": "专辑", "t": "单曲", "b": "艺人"}
+    cache_lines = []
+    valid_count = 0
+
+    print(f"Bandcamp 搜索结果 (共 {len(raw_results[:20])} 条):")
+    for r in raw_results[:20]:
+        t = r.get("type")
+        name = clean_title(r.get("name"), default="未知")
+        band = clean_title(r.get("band_name"), default="")
+        target_url = clean_bandcamp_url(r.get("url") or "")
+        if not target_url:
+            continue
+
+        valid_count += 1
+        t_label = type_map.get(t, t)
+        desc = f"{name} — {band}" if band else name
+        print(f"{valid_count:3d}. [{t_label}] {desc}")
+        cache_lines.append(f"{target_url} [{t_label}] {desc}\n")
+
+    try:
+        os.makedirs(os.path.dirname(SEARCH_CACHE), exist_ok=True)
+        with open(SEARCH_CACHE, "w", encoding="utf-8") as f:
+            f.writelines(cache_lines)
+        try:
+            os.chmod(SEARCH_CACHE, 0o666)
+        except OSError:
+            pass
+        print("播放: radioctl bandcamp play <序号> (从 1 起)")
+    except Exception as e:
+        log(f"警告: 搜索缓存写入失败: {e}")
+
+
+def cmd_list_search_cache(args: list[str]):
+    """输出搜索缓存内容，或展开指定序号项。"""
+    if not os.path.isfile(SEARCH_CACHE):
+        die("搜索缓存不存在, 请先执行 radioctl bandcamp search <关键词>", 24)
+
+    try:
+        with open(SEARCH_CACHE, "r", encoding="utf-8") as f:
+            lines = [l.strip() for l in f.readlines() if l.strip()]
+    except Exception as e:
+        die(f"读取搜索缓存失败: {e}", 23)
+
+    if not lines:
+        die("搜索缓存为空", 24)
+
+    if args:
+        try:
+            idx = int(args[0])
+            if idx < 0 or idx >= len(lines):
+                die(f"下标超范围 (0..{len(lines)-1})", 24)
+            line = lines[idx]
+            target_url = line.split(" ", 1)[0]
+            kind, clean_url = parse_bandcamp_input(target_url)
+            if kind == "album":
+                cmd_list_album([clean_url])
+            elif kind == "artist":
+                cmd_list_artist([clean_url])
+            else:
+                cmd_list_track([clean_url])
+            return
+        except ValueError:
+            pass
+
+    for l in lines:
+        print(l)
+
+
+def extract_stream_url(target_url: str) -> tuple[str, str]:
+    """
+    从目标 URL 中提取 128k MP3 直链与显示标题。
+    支持直接的 track 链接、带 fragment 的 album#t1 链接、或纯 album 链接。
+    """
+    clean_url = clean_bandcamp_url(target_url)
+    parsed = urllib.parse.urlparse(clean_url)
+    fragment = parsed.fragment
+    base_url = urllib.parse.urlunparse(parsed._replace(fragment=""))
+
+    data = parse_page_tralbum(base_url)
+    if not data:
+        die(f"无法解析 Bandcamp 页面数据: {target_url}", 22)
+
+    artist = clean_title(data.get("artist"), default="Bandcamp")
+    trackinfo = data.get("trackinfo", [])
+    if not trackinfo:
+        die(f"该页面未包含曲目: {target_url}", 22)
+
+    target_track = None
+
+    if fragment.startswith("t") and fragment[1:].isdigit():
+        tnum = int(fragment[1:])
+        for t in trackinfo:
+            if t.get("track_num") == tnum:
+                target_track = t
+                break
+    elif fragment.startswith("track-") and fragment[6:].isdigit():
+        tid = int(fragment[6:])
+        for t in trackinfo:
+            if t.get("track_id") == tid:
+                target_track = t
+                break
+
+    if not target_track:
+        for t in trackinfo:
+            f = t.get("file")
+            if f and isinstance(f, dict) and f.get("mp3-128"):
+                target_track = t
+                break
+
+    if not target_track:
+        die(f"未找到可播出的音频流: {target_url}", 22)
+
+    file_dict = target_track.get("file")
+    if not (file_dict and isinstance(file_dict, dict) and file_dict.get("mp3-128")):
+        die(f"曲目 '{target_track.get('title')}' 未提供免费试听流 (受限)", 22)
+
+    stream_url = file_dict.get("mp3-128")
+    title = clean_title(target_track.get("title"), default="未知曲目")
+    return stream_url, f"{artist} - {title}"
+
+
+def cmd_stream(args: list[str]):
+    """解析 Bandcamp 纯音频直链并通过 ffmpeg 转 s16le PCM 进入 FIFO。"""
+    if not args:
+        die("用法: bandcamp-helper stream <url> [target_fifo] [start_time]", 24)
+    raw = args[0].strip().strip("'\"")
+    fifo = args[1].strip().strip("'\"") if len(args) > 1 else AUDIO_FIFO
+    ss = args[2].strip().strip("'\"") if len(args) > 2 else ""
+
+    stream_url, track_desc = extract_stream_url(raw)
+    log(f"开始拉流: {track_desc}")
+
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "warning",
+        "-nostdin",
+        "-y",
+        "-rw_timeout", "15000000",
+        "-user_agent", DEFAULT_UA,
+    ]
+    if ss:
+        ffmpeg_cmd.extend(["-ss", ss])
+    ffmpeg_cmd.extend([
+        "-i", stream_url,
+        "-vn",
+        "-map", "0:a:0",
+        "-ac", "2",
+        "-ar", "44100",
+        "-f", "s16le",
+        fifo,
+    ])
+
+    p_ff = subprocess.Popen(ffmpeg_cmd)
+
+    def handle_signal(sig, frame):
+        try:
+            p_ff.terminate()
+        except OSError:
+            pass
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    ret = p_ff.wait()
+    sys.exit(ret)
+
+
+def usage():
+    cat = """用法: bandcamp-helper <子命令>
+  resolve <链接/文案>               智能解析类型 (track / album / artist / search)
+  list track <链接/文案>            单曲信息 → 1 行 "<track_url> <标题>"
+  list album <链接/文案>            专辑曲目列表 → 每行 "<track_url> <标题>"
+  list artist <链接/文案>           艺人全库作品列表 → 每行 "<track_url> <标题>"
+  list search-cache [序号]          输出上一次搜索结果缓存或展开指定序号项
+  search <关键词...>                搜索 Bandcamp，显示编号列表并写缓存
+  stream <链接> [fifo] [时点]       解析音频直链并推入 FIFO
+"""
+    sys.stderr.write(cat)
+    sys.exit(24)
+
+
+def main():
+    if len(sys.argv) < 2:
+        usage()
+    sub = sys.argv[1]
+    args = sys.argv[2:]
+
+    if sub == "resolve":
+        cmd_resolve(args)
+    elif sub == "list":
+        if not args:
+            die("用法: bandcamp-helper list track|album|artist|search-cache", 24)
+        item = args[0]
+        if item == "track":
+            cmd_list_track(args[1:])
+        elif item == "album":
+            cmd_list_album(args[1:])
+        elif item == "artist":
+            cmd_list_artist(args[1:])
+        elif item == "search-cache":
+            cmd_list_search_cache(args[1:])
+        else:
+            die(f"未知 list 类型: {item}", 24)
+    elif sub == "search":
+        cmd_search(args)
+    elif sub == "stream":
+        cmd_stream(args)
+    else:
+        usage()
+
+
+if __name__ == "__main__":
+    main()

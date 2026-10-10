@@ -1,0 +1,33 @@
+[Unit]
+Description=VPS Radio admin panel backend (python3, 127.0.0.1:8811, behind Caddy /admin basic_auth)
+After=network.target radiod.service
+
+[Service]
+Type=simple
+User=radiod
+Group=radiod
+ExecStart=/usr/bin/python3 /usr/local/bin/radio-admin
+Restart=on-failure
+RestartSec=3
+# 只读系统命令面; 写面 = /run/radiod 与 /var/lib/radiod (见下)
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+# 与 radiod.service 共同持有 /run/radiod: systemd 按名引用计数, 两 unit 都停才删目录,
+# radiod Restart=always 频繁重启不再重建目录 → 本服务 rw bind 始终钉在活 inode 上。
+# 面板搜索缓存 (helper 写 /run/radiod/*_search.cache) 依赖此 rw 挂载。
+# 勿退回 ReadWritePaths=/run/radiod: ProtectSystem=strict 下该声明在 systemd 255 实测被
+# 静默跳过 (ns 内无 rw bind, 写缓存 EROFS), 2026-09-15 面板搜索点歌失败即此坑
+RuntimeDirectory=radiod
+RuntimeDirectoryMode=0775
+# 停止时不删目录 (与 radiod 同款双保险): 覆盖"两 unit 同停"的维护窗口, 保住面板写入的缓存
+RuntimeDirectoryPreserve=yes
+# 网易面板扫码登录: helper 803 时 save_login_cookie 写 /var/lib/radiod/netease_cookie;
+# SC helper CID 自愈刷新 (soundcloud_cid / sc_last_scrape) 同样需要
+StateDirectory=radiod
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
