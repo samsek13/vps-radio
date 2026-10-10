@@ -6,12 +6,12 @@
 <meta name="robots" content="noindex">
 <title>JAM · 在线电台</title>
 <style>
-  :root { color-scheme: dark; }
+  :root { color-scheme: light; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   html, body {
     height: 100%;
-    background: #0a0a0c;
-    color: #d8dae0;
+    background: #ece4d4;
+    color: #3a3733;
     font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
     overflow: hidden;
     user-select: none;
@@ -25,36 +25,36 @@
     transform: translate(-50%, -50%) scale(var(--s, 1));
     border-radius: 16px;
     background:
-      radial-gradient(130% 90% at 50% 0%, rgba(255,255,255,.05), transparent 55%),
-      repeating-linear-gradient(0deg, rgba(255,255,255,.014) 0 1px, transparent 1px 3px),
-      linear-gradient(180deg, #2b2c31 0%, #232428 52%, #1b1c20 100%);
+      radial-gradient(130% 90% at 50% 0%, rgba(255,255,255,.5), transparent 55%),
+      repeating-linear-gradient(0deg, rgba(0,0,0,.012) 0 1px, transparent 1px 3px),
+      linear-gradient(180deg, #f4f1ea 0%, #e8e5dc 52%, #dddad2 100%);
     box-shadow:
-      0 40px 80px rgba(0,0,0,.65), 0 6px 18px rgba(0,0,0,.5),
-      inset 0 1px 0 rgba(255,255,255,.09), inset 0 -3px 8px rgba(0,0,0,.5),
-      inset 0 0 0 1px rgba(0,0,0,.55);
+      0 40px 80px rgba(90,70,50,.28), 0 6px 18px rgba(90,70,50,.18),
+      inset 0 1px 0 rgba(255,255,255,.9), inset 0 -3px 8px rgba(0,0,0,.08),
+      inset 0 0 0 1px rgba(0,0,0,.06);
   }
   /* 哑光颗粒纹理 */
   .deck::before {
     content: ""; position: absolute; inset: 0; border-radius: 16px;
-    opacity: .04; pointer-events: none;
+    opacity: .05; pointer-events: none;
     background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23n)'/%3E%3C/svg%3E");
   }
   /* 四角螺丝 */
   .screw {
     position: absolute; width: 11px; height: 11px; border-radius: 50%;
-    background: radial-gradient(circle at 35% 30%, #6a6d74, #2c2d32 70%);
-    box-shadow: inset 0 -1px 1px rgba(0,0,0,.7), 0 1px 1px rgba(255,255,255,.05);
+    background: radial-gradient(circle at 35% 30%, #f5f3ee, #b8b4aa 70%);
+    box-shadow: inset 0 -1px 1px rgba(0,0,0,.15), 0 1px 1px rgba(255,255,255,.7);
   }
   .screw::after {
     content: ""; position: absolute; left: 1.5px; top: 5px; width: 8px; height: 1.2px;
-    background: rgba(0,0,0,.55); transform: rotate(38deg);
+    background: rgba(0,0,0,.25); transform: rotate(38deg);
   }
   .screw.tl { left: 12px; top: 12px; } .screw.tr { right: 12px; top: 12px; }
   .screw.bl { left: 12px; bottom: 12px; } .screw.br { right: 12px; bottom: 12px; }
 
   .silk {
     position: absolute; font-size: 9px; letter-spacing: .28em;
-    color: #83878e; text-shadow: 0 -1px 1px rgba(0,0,0,.8), 0 1px 0 rgba(255,255,255,.05);
+    color: #a29a8d; text-shadow: 0 1px 0 rgba(255,255,255,.6);
     white-space: nowrap;
   }
 
@@ -62,15 +62,15 @@
   .speeds { position: absolute; left: 30px; top: 26px; display: flex; gap: 8px; }
   .speed {
     width: 40px; height: 26px; border: 0; border-radius: 3px; cursor: pointer;
-    font: 700 11px/1 "Courier New", monospace; letter-spacing: .08em; color: #6e727a;
-    background: linear-gradient(180deg, #33343a, #242529);
-    box-shadow: 0 3px 0 #131417, inset 0 1px 0 rgba(255,255,255,.1), inset 0 0 0 1px rgba(0,0,0,.5);
+    font: 700 11px/1 "Courier New", monospace; letter-spacing: .08em; color: #8a857c;
+    background: linear-gradient(180deg, #fbf9f4, #e2ded5);
+    box-shadow: 0 3px 0 #b8b3a8, inset 0 1px 0 rgba(255,255,255,.9), inset 0 0 0 1px rgba(0,0,0,.08);
   }
-  .speed:active { transform: translateY(2px); box-shadow: 0 1px 0 #131417, inset 0 0 0 1px rgba(0,0,0,.5); }
+  .speed:active { transform: translateY(2px); box-shadow: 0 1px 0 #b8b3a8, inset 0 0 0 1px rgba(0,0,0,.08); }
   .speed.on {
-    color: #ffb54d; text-shadow: 0 0 6px rgba(255,160,60,.55);
-    background: linear-gradient(180deg, #3a3227, #2b251d);
-    box-shadow: 0 3px 0 #131417, inset 0 1px 0 rgba(255,255,255,.08), inset 0 0 8px rgba(255,160,60,.12), inset 0 0 0 1px rgba(0,0,0,.5);
+    color: #d93a2b; text-shadow: 0 0 5px rgba(217,58,43,.4);
+    background: linear-gradient(180deg, #fbf0ec, #ead9d2);
+    box-shadow: 0 3px 0 #b8b3a8, inset 0 1px 0 rgba(255,255,255,.8), inset 0 0 8px rgba(217,58,43,.1), inset 0 0 0 1px rgba(0,0,0,.08);
   }
   .speeds-label { left: 30px; top: 58px; }
 
@@ -81,7 +81,7 @@
     background: radial-gradient(circle at 35% 30%, #ff7b6e, #c92a1e 60%, #7d140c);
     box-shadow: 0 0 7px rgba(255,60,40,.75), inset 0 -1px 2px rgba(0,0,0,.5);
   }
-  .powerbox .pwrtxt { font-size: 9px; letter-spacing: .28em; color: #83878e; }
+  .powerbox .pwrtxt { font-size: 9px; letter-spacing: .28em; color: #a29a8d; }
 
   /* ON AIR 灯 */
   .onair { position: absolute; left: 592px; top: 30px; display: flex; align-items: center; gap: 7px; }
@@ -105,7 +105,7 @@
     box-shadow:
       inset 0 0 0 1px rgba(0,0,0,.9), inset 0 2px 10px rgba(0,0,0,.9),
       inset 0 -1px 3px rgba(120,255,220,.05),
-      0 1px 0 rgba(255,255,255,.06);
+      0 2px 6px rgba(0,0,0,.18), 0 1px 0 rgba(255,255,255,.4);
     overflow: hidden;
   }
   .vfd-inner {
@@ -143,27 +143,27 @@
   /* 转盘井凹槽: 唱盘沉在机身圆井里 */
   .well {
     position: absolute; left: 55px; top: 83px; width: 410px; height: 410px; border-radius: 50%;
-    background: radial-gradient(circle, #16171a 58%, #1e1f23 76%, #131417);
+    background: radial-gradient(circle, #d9d5cb 58%, #c9c4b9 76%, #c2bdb1);
     box-shadow:
-      inset 0 8px 18px rgba(0,0,0,.8), inset 0 -2px 5px rgba(255,255,255,.04),
-      0 1px 0 rgba(255,255,255,.06);
+      inset 0 8px 18px rgba(0,0,0,.22), inset 0 -2px 5px rgba(255,255,255,.5),
+      0 1px 0 rgba(255,255,255,.7);
   }
   .platter { position: absolute; left: 70px; top: 98px; width: 380px; height: 380px; }
   /* 转盘静态阴影环 */
   .platter::before {
     content: ""; position: absolute; inset: -6px; border-radius: 50%;
-    background: radial-gradient(circle, transparent 62%, rgba(0,0,0,.5) 78%, rgba(0,0,0,.25) 100%);
-    box-shadow: 0 16px 28px rgba(0,0,0,.5);
+    background: radial-gradient(circle, transparent 62%, rgba(0,0,0,.18) 78%, rgba(0,0,0,.08) 100%);
+    box-shadow: 0 16px 28px rgba(60,50,40,.3);
   }
   .platter-spin {
     position: absolute; inset: 0; border-radius: 50%; cursor: grab;
-    /* 金属转盘环 + 盘沿台阶 */
+    /* 浅银转盘环 + 盘沿台阶 */
     background:
-      radial-gradient(circle, transparent 63%, rgba(255,255,255,.05) 63.5%, transparent 64.5%),
-      conic-gradient(from 210deg, #43454b, #585a61 16%, #33343a 30%, #4e5057 50%, #2e2f34 68%, #505258 84%, #43454b);
+      radial-gradient(circle, transparent 63%, rgba(255,255,255,.5) 63.5%, transparent 64.5%),
+      conic-gradient(from 210deg, #d4d6d9, #eef0f1 16%, #c2c4c7 30%, #e2e4e6 50%, #c5c7ca 68%, #e6e8ea 84%, #d4d6d9);
     box-shadow:
-      inset 0 2px 2px rgba(255,255,255,.2), inset 0 -4px 8px rgba(0,0,0,.55),
-      inset 0 0 0 2px rgba(0,0,0,.4);
+      inset 0 2px 2px rgba(255,255,255,.8), inset 0 -4px 8px rgba(0,0,0,.15),
+      inset 0 0 0 2px rgba(0,0,0,.08);
     will-change: transform;
   }
   .platter-spin:active { cursor: grabbing; }
@@ -181,21 +181,36 @@
   .label {
     position: absolute; left: 50%; top: 50%; width: 124px; height: 124px;
     transform: translate(-50%, -50%); border-radius: 50%;
-    background: radial-gradient(circle at 42% 38%, #4a4136, #332c24 62%, #241f19);
-    box-shadow: inset 0 0 0 1px rgba(0,0,0,.7), inset 0 1px 2px rgba(255,255,255,.12);
+    background: radial-gradient(circle at 42% 38%, #f2ead6, #e2d7bd 62%, #cfc3a6);
+    box-shadow: inset 0 0 0 1px rgba(0,0,0,.25), inset 0 1px 2px rgba(255,255,255,.6);
     display: flex; align-items: center; justify-content: center;
+    overflow: hidden;
   }
   .label::before {
     content: ""; position: absolute; inset: 10px; border-radius: 50%;
-    border: 1px solid rgba(255,255,255,.1); border-bottom-color: rgba(0,0,0,.4);
+    border: 1px solid rgba(0,0,0,.15); border-bottom-color: rgba(0,0,0,.3);
+    z-index: 2;
   }
+  /* 唱片封面图 (画胶), 无封面时走程序化配色标签 */
+  .discart {
+    position: absolute; inset: 5px; border-radius: 50%;
+    background-size: cover; background-position: center;
+    box-shadow: inset 0 0 0 1px rgba(0,0,0,.4), inset 0 0 14px rgba(0,0,0,.2);
+    display: none; z-index: 1;
+  }
+  .label.art .label-txt { display: none; }
   .label-txt {
-    font-size: 13px; font-weight: 800; letter-spacing: .34em; text-indent: .34em;
-    color: #c8b98f; text-shadow: 0 -1px 1px rgba(0,0,0,.7);
+    position: absolute; left: 0; right: 0; top: 22px; text-align: center;
+    font-size: 11px; font-weight: 800; letter-spacing: .34em; text-indent: .34em;
+    color: #a03428; text-shadow: 0 1px 0 rgba(255,255,255,.5);
+    z-index: 2;
   }
-  .label-dot {  /* 标签偏心定位点 */
-    position: absolute; right: 16px; top: 30px; width: 7px; height: 7px; border-radius: 50%;
-    background: #8f835e; box-shadow: inset 0 -1px 1px rgba(0,0,0,.6);
+  .label-dot {  /* 标签中心红点 (参考图的红色芯) */
+    position: absolute; left: 50%; top: 50%; width: 24px; height: 24px;
+    transform: translate(-50%, -50%); border-radius: 50%;
+    background: radial-gradient(circle at 40% 35%, #e8574a, #c92f22 65%, #8f1d13);
+    box-shadow: inset 0 -1px 2px rgba(0,0,0,.3), 0 0 0 2px rgba(0,0,0,.08);
+    z-index: 2;
   }
   .spindle {
     position: absolute; left: 50%; top: 50%; width: 10px; height: 10px;
@@ -211,13 +226,13 @@
     background: rgba(18,19,22,.85);
     box-shadow: 0 0 0 .5px rgba(255,255,255,.06);
   }
-  .strobe.locked i { background: rgba(30,26,18,.9); box-shadow: 0 0 3px rgba(255,170,70,.35); }
-  /* 频闪灯珠 (盘沿 9 点位) */
+  .strobe.locked i { background: #3a3630; box-shadow: 0 0 3px rgba(217,58,43,.5); }
+  /* 频闪灯珠 (盘沿 9 点位, 红灯) */
   .strobe-lamp {
     position: absolute; left: -17px; top: 50%; width: 7px; height: 7px;
     transform: translateY(-50%); border-radius: 50%;
-    background: radial-gradient(circle at 40% 30%, #ffd9a0, #b06a1c 65%, #5c330a);
-    box-shadow: 0 0 8px rgba(255,170,70,.7), 0 0 18px rgba(255,170,70,.15);
+    background: radial-gradient(circle at 40% 30%, #ff8a7c, #c92f22 65%, #7d140c);
+    box-shadow: 0 0 8px rgba(217,58,43,.7), 0 0 16px rgba(217,58,43,.15);
     opacity: .25; transition: opacity .4s;
   }
   .strobe-lamp.on { opacity: 1; }
@@ -225,21 +240,21 @@
   /* ================= 唱臂 (右侧) ================= */
   .pivot-base {
     position: absolute; left: 641px; top: 126px; width: 48px; height: 48px; border-radius: 50%;
-    background: radial-gradient(circle at 36% 30%, #5d5f66, #2a2b30 68%, #191a1d);
-    box-shadow: 0 4px 10px rgba(0,0,0,.6), inset 0 1px 1px rgba(255,255,255,.16);
+    background: radial-gradient(circle at 36% 30%, #e2dfd8, #b4afa4 68%, #98938a);
+    box-shadow: 0 4px 10px rgba(0,0,0,.2), inset 0 1px 1px rgba(255,255,255,.7);
   }
   .pivot-base::after {
     content: ""; position: absolute; left: 50%; top: 50%; width: 14px; height: 14px;
     transform: translate(-50%, -50%); border-radius: 50%;
-    background: radial-gradient(circle at 35% 30%, #84888f, #303136 70%);
-    box-shadow: inset 0 -1px 2px rgba(0,0,0,.7);
+    background: radial-gradient(circle at 35% 30%, #4a4a4e, #1e1e22 70%);
+    box-shadow: inset 0 -1px 2px rgba(0,0,0,.5);
   }
   .tonearm { position: absolute; left: 665px; top: 150px; width: 0; height: 0; will-change: transform; }
   .arm-rotate { position: absolute; left: 0; top: 0; will-change: transform; }
   .arm-shaft {
-    position: absolute; left: -368px; top: -3px; width: 368px; height: 6px; border-radius: 3px;
-    background: linear-gradient(180deg, #d4d7dc, #9a9ea5 45%, #6f737a 55%, #8b8f96);
-    box-shadow: 0 3px 5px rgba(0,0,0,.5);
+    position: absolute; left: -368px; top: -3px; width: 368px; height: 5px; border-radius: 3px;
+    background: linear-gradient(180deg, #3d3d42, #1b1b1f);
+    box-shadow: 0 3px 5px rgba(0,0,0,.35);
   }
   .headshell {
     position: absolute; left: -398px; top: -8px; width: 46px; height: 17px;
@@ -264,72 +279,72 @@
     opacity: .85;
   }
   .arm-rear {
-    position: absolute; left: 0; top: -3px; width: 66px; height: 6px; border-radius: 3px;
-    background: linear-gradient(180deg, #c9ccd1, #787c82);
-    box-shadow: 0 3px 5px rgba(0,0,0,.5);
+    position: absolute; left: 0; top: -3px; width: 66px; height: 5px; border-radius: 3px;
+    background: linear-gradient(180deg, #3d3d42, #1b1b1f);
+    box-shadow: 0 3px 5px rgba(0,0,0,.35);
   }
   /* 配重锤 */
   .counterweight {
     position: absolute; left: 58px; top: -14px; width: 46px; height: 28px; border-radius: 6px;
-    background: repeating-linear-gradient(90deg, #3d3e44 0 3px, #54565d 3px 4.5px);
-    box-shadow: 0 4px 8px rgba(0,0,0,.65), inset 0 1px 0 rgba(255,255,255,.18), inset 0 -2px 4px rgba(0,0,0,.6);
+    background: repeating-linear-gradient(90deg, #2b2b30 0 3px, #454549 3px 4.5px);
+    box-shadow: 0 4px 8px rgba(0,0,0,.4), inset 0 1px 0 rgba(255,255,255,.15), inset 0 -2px 4px rgba(0,0,0,.6);
   }
   .counterweight::after {
     content: ""; position: absolute; right: -7px; top: 3px; width: 7px; height: 22px; border-radius: 3px;
-    background: linear-gradient(90deg, #4a4c53, #26272b);
-    box-shadow: 0 3px 6px rgba(0,0,0,.6);
+    background: linear-gradient(90deg, #3a3a3f, #1c1c20);
+    box-shadow: 0 3px 6px rgba(0,0,0,.35);
   }
   /* 抬臂杆 (cue lever) */
   .cue {
     position: absolute; left: 614px; top: 208px; width: 26px; height: 4px; border-radius: 2px;
     transform-origin: right center; transform: rotate(-24deg);
-    background: linear-gradient(180deg, #c9ccd1, #6f737a);
-    box-shadow: 0 2px 3px rgba(0,0,0,.5);
+    background: linear-gradient(180deg, #e2dfd8, #a9a49a);
+    box-shadow: 0 2px 3px rgba(0,0,0,.2);
     transition: transform .35s ease;
   }
   .cue::after {
     content: ""; position: absolute; left: -4px; top: -4px; width: 9px; height: 9px; border-radius: 50%;
-    background: radial-gradient(circle at 35% 30%, #e8eaee, #6e727a 70%);
+    background: radial-gradient(circle at 35% 30%, #4a4a4e, #1e1e22 70%);
   }
   .cue.up { transform: rotate(-52deg); }
   /* 防侧滑旋钮 */
   .antiskate {
     position: absolute; left: 694px; top: 204px; width: 28px; height: 28px; border-radius: 50%;
     background:
-      radial-gradient(circle at 40% 32%, rgba(255,255,255,.14), transparent 55%),
-      repeating-conic-gradient(#3d3e44 0 7deg, #54565d 7deg 14deg);
-    box-shadow: 0 3px 6px rgba(0,0,0,.6), inset 0 0 0 1px rgba(0,0,0,.6), inset 0 1px 0 rgba(255,255,255,.12);
+      radial-gradient(circle at 40% 32%, rgba(255,255,255,.6), transparent 55%),
+      repeating-conic-gradient(#cbc7bd 0 7deg, #a8a397 7deg 14deg);
+    box-shadow: 0 3px 6px rgba(0,0,0,.25), inset 0 0 0 1px rgba(0,0,0,.15), inset 0 1px 0 rgba(255,255,255,.6);
   }
   .antiskate::after {
     content: ""; position: absolute; left: 50%; top: 2px; width: 2px; height: 9px;
-    background: #b9bcc2; transform: translateX(-50%); border-radius: 1px;
+    background: #6a6559; transform: translateX(-50%); border-radius: 1px;
   }
   /* 臂托 */
   .armrest { position: absolute; left: 474px; top: 470px; width: 10px; height: 22px;
-    background: linear-gradient(90deg, #3c3d43, #232428); border-radius: 2px;
-    box-shadow: 0 2px 4px rgba(0,0,0,.5), inset 0 1px 0 rgba(255,255,255,.1); }
+    background: linear-gradient(90deg, #b8b3a8, #98938a); border-radius: 2px;
+    box-shadow: 0 2px 4px rgba(0,0,0,.2), inset 0 1px 0 rgba(255,255,255,.5); }
   .armrest::before { content: ""; position: absolute; left: -3px; top: -5px; width: 16px; height: 7px;
-    background: #3c3d43; border-radius: 3px; box-shadow: inset 0 1px 0 rgba(255,255,255,.12); }
+    background: #b8b3a8; border-radius: 3px; box-shadow: inset 0 1px 0 rgba(255,255,255,.6); }
 
   /* ================= PITCH 推子 (右侧, ±8%) ================= */
   .pitch { position: absolute; left: 706px; top: 322px; width: 28px; height: 132px; cursor: ns-resize; }
   .pitch-track {
     position: absolute; left: 12px; top: 0; width: 4px; height: 132px; border-radius: 2px;
-    background: #0e0f12;
-    box-shadow: inset 0 2px 5px rgba(0,0,0,.9), 0 1px 0 rgba(255,255,255,.06);
+    background: #a8a397;
+    box-shadow: inset 0 2px 5px rgba(0,0,0,.35), 0 1px 0 rgba(255,255,255,.6);
   }
   .pitch-scale {  /* 左侧刻度 */
     position: absolute; left: 0; top: 0; width: 8px; height: 132px;
-    background: repeating-linear-gradient(0deg, #4a4d54 0 1px, transparent 1px 12.2px);
+    background: repeating-linear-gradient(0deg, #a29a8d 0 1px, transparent 1px 12.2px);
   }
   .pitch-center {  /* 中点卡位标记 */
     position: absolute; left: 8px; top: 65px; width: 16px; height: 2px;
-    background: rgba(255,178,87,.55); box-shadow: 0 0 3px rgba(255,178,87,.3);
+    background: rgba(217,58,43,.7); box-shadow: 0 0 3px rgba(217,58,43,.3);
   }
   .pitch-thumb {
     position: absolute; left: 2px; top: 59px; width: 24px; height: 14px; border-radius: 3px;
-    background: linear-gradient(180deg, #d7d9de, #8b8f96 50%, #5f636a);
-    box-shadow: 0 3px 6px rgba(0,0,0,.6), inset 0 1px 0 rgba(255,255,255,.55), inset 0 -1px 2px rgba(0,0,0,.4);
+    background: linear-gradient(180deg, #fdfcf9, #d8d4ca 50%, #b5b0a4);
+    box-shadow: 0 3px 6px rgba(0,0,0,.3), inset 0 1px 0 rgba(255,255,255,.9), inset 0 -1px 2px rgba(0,0,0,.2);
   }
   .pitch-thumb::after { content: ""; position: absolute; left: 4px; right: 4px; top: 6px; height: 2px; background: rgba(0,0,0,.45); }
   .pitch-label { left: 694px; top: 462px; }
@@ -337,39 +352,40 @@
   /* ================= START / STOP 实体键 ================= */
   .ssplate {  /* 按键沉板 */
     position: absolute; left: 34px; top: 454px; width: 108px; height: 72px; border-radius: 8px;
-    background: linear-gradient(180deg, #1d1e22, #222327);
-    box-shadow: inset 0 2px 7px rgba(0,0,0,.75), 0 1px 0 rgba(255,255,255,.05);
+    background: linear-gradient(180deg, #d5d1c7, #e0dcd3);
+    box-shadow: inset 0 2px 7px rgba(0,0,0,.2), 0 1px 0 rgba(255,255,255,.7);
   }
-  .startstop {
+  .startstop {  /* 参考图的标志性红键 */
     position: absolute; left: 42px; top: 462px; width: 92px; height: 56px;
     border: 0; border-radius: 5px; cursor: pointer;
-    font: 700 10px/1.5 "Courier New", monospace; letter-spacing: .22em; color: #9a9ea6;
-    background: linear-gradient(180deg, #3a3b41, #26272b 60%, #1f2023);
+    font: 700 10px/1.5 "Courier New", monospace; letter-spacing: .22em; color: #fff3ee;
+    text-shadow: 0 -1px 1px rgba(0,0,0,.3);
+    background: linear-gradient(180deg, #e8434a, #c92f22 60%, #a82215);
     box-shadow:
-      0 5px 0 #101113, 0 8px 14px rgba(0,0,0,.55),
-      inset 0 1px 0 rgba(255,255,255,.14), inset 0 0 0 1px rgba(0,0,0,.55);
+      0 5px 0 #7d1a10, 0 8px 14px rgba(160,40,25,.4),
+      inset 0 1px 0 rgba(255,255,255,.35), inset 0 0 0 1px rgba(0,0,0,.15);
     display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px;
     transition: transform .05s, box-shadow .05s;
   }
   .startstop:active, .startstop.pressed {
     transform: translateY(4px);
     box-shadow:
-      0 1px 0 #101113, 0 3px 6px rgba(0,0,0,.5),
-      inset 0 1px 0 rgba(255,255,255,.1), inset 0 2px 8px rgba(0,0,0,.55), inset 0 0 0 1px rgba(0,0,0,.55);
+      0 1px 0 #7d1a10, 0 3px 6px rgba(160,40,25,.35),
+      inset 0 1px 0 rgba(255,255,255,.25), inset 0 2px 8px rgba(0,0,0,.3), inset 0 0 0 1px rgba(0,0,0,.15);
   }
   .sslamp {
     width: 26px; height: 5px; border-radius: 2px;
-    background: #3a2a1a; transition: background .3s, box-shadow .3s;
+    background: #8f1d13; transition: background .3s, box-shadow .3s;
   }
   .startstop.on .sslamp {
-    background: #ffb54d;
-    box-shadow: 0 0 8px rgba(255,170,70,.8), inset 0 0 2px rgba(255,255,255,.4);
+    background: #ffe9c8;
+    box-shadow: 0 0 8px rgba(255,230,180,.9), inset 0 0 2px rgba(255,255,255,.6);
   }
   /* ================= 听众座位灯 (调音台电平表式, 表头窗) ================= */
   .seats-wrap {
     position: absolute; left: 168px; top: 502px; padding: 5px 9px; border-radius: 4px;
-    background: linear-gradient(180deg, #191a1d, #131417);
-    box-shadow: inset 0 2px 5px rgba(0,0,0,.85), 0 1px 0 rgba(255,255,255,.05), inset 0 0 0 1px rgba(0,0,0,.5);
+    background: linear-gradient(180deg, #d9d5cb, #cfcabf);
+    box-shadow: inset 0 2px 5px rgba(0,0,0,.2), 0 1px 0 rgba(255,255,255,.7), inset 0 0 0 1px rgba(0,0,0,.08);
   }
   .seats {
     height: 14px;
@@ -377,8 +393,8 @@
   }
   .seats i {
     width: 12px; height: 7px; border-radius: 1.5px;
-    background: #2a2620;
-    box-shadow: inset 0 1px 2px rgba(0,0,0,.7), 0 1px 0 rgba(255,255,255,.04);
+    background: #b5afa2;
+    box-shadow: inset 0 1px 2px rgba(0,0,0,.2), 0 1px 0 rgba(255,255,255,.5);
     transition: background .18s, box-shadow .18s;
   }
   .seats i.on {
@@ -390,9 +406,53 @@
   .brand {
     right: 34px; top: 510px; text-align: right; font-size: 10px;
   }
-  .brand em { display: block; font-style: normal; font-size: 8px; letter-spacing: .3em; margin-top: 4px; color: #6d7076; }
+  .brand em { display: block; font-style: normal; font-size: 8px; letter-spacing: .3em; margin-top: 4px; color: #8a857c; }
+
+  /* ================= 频道预设键 (左上区, 白键红字) ================= */
+  .presets { position: absolute; left: 90px; top: 24px; display: grid; grid-template-columns: repeat(2, 76px); gap: 7px; }
+  .pkey {
+    height: 24px; border: 0; border-radius: 3px; cursor: pointer;
+    font: 700 9px/1 "Courier New", "PingFang SC", monospace; letter-spacing: .1em; color: #8a857c;
+    background: linear-gradient(180deg, #fbf9f4, #e2ded5);
+    box-shadow: 0 3px 0 #b8b3a8, inset 0 1px 0 rgba(255,255,255,.9), inset 0 0 0 1px rgba(0,0,0,.08);
+  }
+  .pkey:active { transform: translateY(2px); box-shadow: 0 1px 0 #b8b3a8, inset 0 0 0 1px rgba(0,0,0,.08); }
+  .pkey.on {
+    color: #d93a2b; text-shadow: 0 0 5px rgba(217,58,43,.4);
+    background: linear-gradient(180deg, #fbf0ec, #ead9d2);
+    box-shadow: 0 3px 0 #b8b3a8, inset 0 1px 0 rgba(255,255,255,.8), inset 0 0 8px rgba(217,58,43,.1), inset 0 0 0 1px rgba(0,0,0,.08);
+  }
+  .presets-label { left: 90px; top: 84px; }
 
   audio { display: none; }
+
+  /* ================= 竖屏手机布局 (420×640) ================= */
+  .deck.portrait { width: 420px; height: 640px; }
+  .deck.portrait .speeds { left: 18px; top: 14px; }
+  .deck.portrait .speeds-label { left: 18px; top: 46px; }
+  .deck.portrait .powerbox { right: 18px; top: 14px; }
+  .deck.portrait .onair { left: 150px; top: 18px; }
+  .deck.portrait .vfd { left: 20px; top: 48px; width: 380px; height: 62px; }
+  .deck.portrait .presets { left: 20px; top: 118px; grid-template-columns: repeat(4, 1fr); width: 380px; }
+  .deck.portrait .presets-label { display: none; }
+  .deck.portrait .well { left: 48px; top: 168px; width: 324px; height: 324px; }
+  .deck.portrait .platter { left: 60px; top: 180px; width: 300px; height: 300px; }
+  .deck.portrait .pivot-base { left: 341px; top: 206px; }
+  .deck.portrait .tonearm { left: 365px; top: 230px; }
+  .deck.portrait .arm-shaft { left: -190px; width: 190px; }
+  .deck.portrait .headshell { left: -220px; }
+  .deck.portrait .cue { left: 318px; top: 282px; }
+  .deck.portrait .antiskate { display: none; }
+  .deck.portrait .armrest { left: 346px; top: 400px; }
+  .deck.portrait .pitch { left: 372px; top: 450px; }
+  .deck.portrait .pitch-label { left: auto; right: 16px; top: 578px; }
+  .deck.portrait .ssplate { left: 16px; top: 530px; }
+  .deck.portrait .startstop { left: 24px; top: 538px; }
+  .deck.portrait .seats-wrap { left: 140px; top: 594px; }
+  .deck.portrait .seats i { width: 6px; }
+  .deck.portrait .seats { gap: 3px; }
+  .deck.portrait .seats-label { display: none; }
+  .deck.portrait .brand { display: none; }
 </style>
 </head>
 <body>
@@ -404,6 +464,9 @@
     <button class="speed" id="spd45">45</button>
   </div>
   <div class="silk speeds-label">SPEED</div>
+
+  <div class="presets" id="presets"></div>
+  <div class="silk presets-label">PRESETS</div>
 
   <div class="powerbox"><span class="pwrled"></span><span class="pwrtxt">POWER</span></div>
   <div class="onair"><span class="onair-led" id="onairLed"></span><span class="silk">ON AIR</span></div>
@@ -419,7 +482,7 @@
   <div class="platter">
     <div class="platter-spin" id="spin" title="按 START 开唱 / 按住盘沿点刹">
       <div class="record"></div>
-      <div class="label"><span class="label-txt">JAM</span><i class="label-dot"></i></div>
+      <div class="label" id="discLabel"><div class="discart" id="discArt"></div><span class="label-txt">JAM</span><i class="label-dot"></i></div>
       <div class="spindle"></div>
     </div>
     <div class="strobe" id="s33"></div>
@@ -500,7 +563,7 @@ let statusErr = false;
 
 /* ================= 机械物理 ================= */
 const RPM33 = 100 / 3, RPM45 = 45;
-const ARM_REST = -58, ARM_PLAY = -19.5;
+let ARM_REST = -58, ARM_PLAY = -19.5;   // 竖屏布局时换角度
 let pitch = 0;
 let baseRpm = localStorage.getItem("jam_rpm") === "45" ? RPM45 : RPM33;
 let targetRpm = baseRpm;
@@ -524,17 +587,23 @@ const spd45 = document.getElementById("spd45");
 const onairLed = document.getElementById("onairLed");
 const pitchEl = document.getElementById("pitch");
 const pitchThumb = document.getElementById("pitchThumb");
+const presetsEl = document.getElementById("presets");
+const discArt = document.getElementById("discArt");
+const discLabel = document.getElementById("discLabel");
 
-// 频闪刻度点: 外环 60 点 (33⅓), 内环 45 点 (45)
-function makeDots(el, n, r) {
-  for (let i = 0; i < n; i++) {
-    const d = document.createElement("i");
-    d.style.transform = `translate(-50%,-50%) rotate(${(i * 360) / n}deg) translateY(${-r}px)`;
-    el.appendChild(d);
+// 频闪刻度点: 外环 60 点 (33⅓), 内环 45 点 (45); 半径随盘尺寸算
+function buildDots() {
+  const pr = spin.offsetWidth / 2;
+  for (const [el, n, f] of [[s33El, 60, .968], [s45El, 45, .868]]) {
+    el.innerHTML = "";
+    for (let i = 0; i < n; i++) {
+      const d = document.createElement("i");
+      d.style.transform = `translate(-50%,-50%) rotate(${(i * 360) / n}deg) translateY(${-pr * f}px)`;
+      el.appendChild(d);
+    }
   }
 }
-makeDots(s33El, 60, 184);
-makeDots(s45El, 45, 164);
+buildDots();
 
 function deckStart() {
   motorOn = true;
@@ -672,7 +741,14 @@ function fillVfdLine(text) {
 }
 
 // 第二行优先级: 错误 > 暂停/缓冲/连接中状态 > 曲目
+let toastTxt = "", toastUntil = 0;
+function coolToast(sec) {
+  toastTxt = `稍等 ${Math.ceil(sec || 8)}s 再切`;
+  toastUntil = Date.now() + 1800;
+  renderVfd();
+}
 function line2() {
+  if (toastUntil && Date.now() < toastUntil) return toastTxt;
   if (statusErr) return statusText || "ERROR";
   if (manualPause) return statusText || "已暂停";
   if (!mode) return statusText;
@@ -1008,6 +1084,58 @@ function getClientId() {
 }
 const CLIENT_ID = getClientId();
 
+/* ================= 频道预设 & 封面 ================= */
+let presetsBuilt = "";
+function renderPresets(presets, active) {
+  const key = presets.map(p => p.id).join() + "/" + active;
+  if (key === presetsBuilt && presetsEl.childElementCount) return;
+  presetsBuilt = key;
+  presetsEl.innerHTML = "";
+  for (const p of presets) {
+    const b = document.createElement("button");
+    b.className = "pkey" + (p.id === active ? " on" : "");
+    b.textContent = p.label;
+    b.onclick = () => npCmd("/np/preset", { id: p.id });
+    presetsEl.appendChild(b);
+  }
+  const nx = document.createElement("button");
+  nx.className = "pkey";
+  nx.textContent = "»";
+  nx.title = "NEXT · 下一首";
+  nx.onclick = () => npCmd("/np/skip");
+  presetsEl.appendChild(nx);
+}
+async function npCmd(path, body) {
+  clickSound(2400, .025, .06);
+  try {
+    const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+    if (r.status === 429) {
+      const j = await r.json().catch(() => ({}));
+      coolToast(j.retry_after);
+    } else if (r.ok) {
+      setTimeout(refreshNP, 400);   // 命令已下发, 快刷一次 /np
+    }
+  } catch {}
+}
+// 无封面时按歌名哈希出标签配色 (每张"唱片"不一样)
+function hashHue(s) { let h = 0; for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0; return h % 360; }
+function updateDiscArt(cover, track) {
+  if (cover) {
+    discArt.style.display = "block";
+    discArt.style.backgroundImage = `url("${cover}")`;
+    discLabel.classList.add("art");
+  } else {
+    discArt.style.display = "none";
+    discLabel.classList.remove("art");
+    if (track) {
+      const h = hashHue(track);
+      discLabel.style.background = `radial-gradient(circle at 42% 38%, hsl(${h},38%,72%), hsl(${h},42%,58%) 62%, hsl(${h},36%,46%))`;
+    } else {
+      discLabel.style.background = "";
+    }
+  }
+}
+
 let npLast = "";
 async function refreshNP() {
   try {
@@ -1015,26 +1143,13 @@ async function refreshNP() {
     if (!r.ok) return;
     const s = await r.json();
     renderSeats(s.listeners);
+    renderPresets(s.presets || [], s.preset || "");
     let src = s.source ? (SRC_NAMES[s.source.name] || s.source.name) : "";
     if (s.source && s.source.dir) {
       const dir = s.source.dir;
       if (s.source.name === "soundcloud" && dir.startsWith("likes:")) {
         const user = dir.slice("likes:".length) || "我";
         src = (src ? src + " · " : "") + user + " 的 Likes";
-      } else if (s.source.name === "bilibili") {
-        if (dir.startsWith("video:")) src = (src ? src + " · " : "") + "视频";
-        else if (dir.startsWith("fav:")) src = (src ? src + " · " : "") + "收藏夹";
-        else if (dir.startsWith("season:")) src = (src ? src + " · " : "") + "合集";
-        else if (dir === "search") src = (src ? src + " · " : "") + "搜索点播";
-      } else if (s.source.name === "youtube") {
-        if (dir.startsWith("video:")) src = (src ? src + " · " : "") + "视频";
-        else if (dir.startsWith("playlist:")) src = (src ? src + " · " : "") + "歌单";
-        else if (dir === "search") src = (src ? src + " · " : "") + "搜索点播";
-      } else if (s.source.name === "bandcamp") {
-        if (dir.startsWith("track:")) src = (src ? src + " · " : "") + "单曲";
-        else if (dir.startsWith("album:")) src = (src ? src + " · " : "") + "专辑";
-        else if (dir.startsWith("artist:")) src = (src ? src + " · " : "") + "艺人全库";
-        else if (dir === "search") src = (src ? src + " · " : "") + "搜索点播";
       } else {
         const ctxMap = s.source.name === "soundcloud" ? SC_CTX_NAMES : CTX_NAMES;
         for (const [k, v] of Object.entries(ctxMap)) {
@@ -1046,11 +1161,8 @@ async function refreshNP() {
       ? s.source.idx + "/" + s.source.total : "";
     let track = "";
     if (s.source && s.source.file) {
-      if (s.source.name === "netease" || s.source.name === "soundcloud" || s.source.name === "bilibili" || s.source.name === "youtube" || s.source.name === "bandcamp") {
-        track = s.source.file.split(" ").slice(1).join(" ") || s.source.file;
-      } else {
-        track = s.source.file.split("/").pop();
-      }
+      if (s.source.name === "netease" || s.source.name === "soundcloud") track = s.source.file.split(" ").slice(1).join(" ") || s.source.file;
+      else track = s.source.file.split("/").pop();
     } else if (s.source && s.source.name === "spotify") {
       track = "Spotify 同步";
     }
@@ -1064,6 +1176,7 @@ async function refreshNP() {
         trackText = track;
         renderVfd();
       });
+      updateDiscArt(s.cover, track);                   // 换"唱片"
     }
   } catch {}
 }
@@ -1075,11 +1188,25 @@ setInterval(refreshNP, 12000);
 vfdFlicker(renderVfd);
 
 const deck = document.getElementById("deck");
+// 竖屏窄屏 → 竖版布局 (420×640): 唱臂角度、盘尺寸、缩放基准都换
+const mqPortrait = matchMedia("(max-width: 560px), (max-width: 900px) and (orientation: portrait)");
+function applyLayout() {
+  const p = mqPortrait.matches;
+  deck.classList.toggle("portrait", p);
+  ARM_REST = p ? -86 : -58;
+  ARM_PLAY = p ? -58 : -19.5;
+  armTarget = motorOn ? ARM_PLAY : ARM_REST;   // 布局切换后臂按播放意图重定位
+  buildDots();
+  fit();
+}
 function fit() {
-  scaleS = Math.min(innerWidth / 800, innerHeight / 580, 1.4);
+  const p = deck.classList.contains("portrait");
+  scaleS = Math.min(innerWidth / (p ? 440 : 800), innerHeight / (p ? 680 : 580), p ? 1.6 : 1.4);
   deck.style.setProperty("--s", scaleS);
 }
+mqPortrait.addEventListener("change", applyLayout);
 addEventListener("resize", fit);
+applyLayout();
 fit();
 </script>
 </body>

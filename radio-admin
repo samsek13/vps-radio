@@ -51,6 +51,27 @@ LISTENER_TTL = 60          # 秒; 客户端轮询间隔 12s, 5 次未到即视�
 _listeners: dict[str, tuple[float, str]] = {}   # {key: (last_seen_ts, ip)}
 _listeners_lock = threading.Lock()
 
+# ---- 公开频道预设 ----
+# 播放页预设键可切: 白名单命令 (不含任意路径/id, 防滥用); 全局冷却防听众互抢
+# /np 返回 presets+当前 active; POST /np/preset {"id"} / POST /np/skip 写 cmd.fifo
+PUBLIC_PRESETS = [
+    ("daily",   "日推",   "switch-to-netease daily"),
+    ("fm",      "私人FM", "switch-to-netease fm"),
+    ("library", "媒体库", f"switch-to-folder {MEDIA_DIR} shuffle"),
+]
+NP_CMD_COOLDOWN = 8.0        # 秒; 全体听众共享
+_np_cmd_ts = 0.0
+_np_cmd_lock = threading.Lock()
+
+# ---- 曲目封面缓存 ("<src>:<id>" → url | None已查过) ----
+_cover_cache: dict = {}
+NCM_DETAIL = "https://music.163.com/api/song/detail/"
+# 与 netease-helper 同款伪装头 (海外 VPS 走明文 api 必需)
+NCM_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "X-Real-IP": "116.25.137.244",
+}
+
 # ---- 音频放大器 (服务端总线增益) ----
 VOL_FILE = Path("/var/lib/radiod/bus_volume")
 ZMQ_ADDR = "tcp://127.0.0.1:5555"
@@ -146,6 +167,60 @@ def get_soundcloud_cid() -> str:
     except OSError:
         pass
     return "Pb72ranhoyt6gw7hM7TkzUItXlMWSNSo"
+
+
+def _get_json(url: str, headers: dict | None = None, timeout: int = 3):
+    req = urllib.request.Request(url, headers=headers or {})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def _cover(key: str, fetch) -> str | None:
+    if key in _cover_cache:
+        return _cover_cache[key]
+    try:
+        url = fetch()
+    except Exception:
+        url = None
+    _cover_cache[key] = url
+    return url
+
+
+def netease_cover(song_id: str) -> str | None:
+    if not song_id.isdigit():
+        return None
+    def f():
+        j = _get_json(f"{NCM_DETAIL}?id={song_id}&ids=[{song_id}]", NCM_HEADERS)
+        s = (j.get("songs") or [{}])[0]
+        al = s.get("al") or s.get("album") or {}
+        return al.get("picUrl")
+    return _cover(f"ne:{song_id}", f)
+
+
+def soundcloud_cover(track_id: str) -> str | None:
+    if not track_id.isdigit():
+        return None
+    def f():
+        j = _get_json(f"https://api-v2.soundcloud.com/tracks/{track_id}?client_id={get_soundcloud_cid()}")
+        art = j.get("artwork_url") or (j.get("user") or {}).get("avatar_url")
+        return art.replace("-large", "-t500x500") if art else None
+    return _cover(f"sc:{track_id}", f)
+
+
+def np_cover(src: dict) -> str | None:
+    fid = (src.get("file") or "").split(" ", 1)[0]
+    if src.get("name") == "netease":
+        return netease_cover(fid)
+    if src.get("name") == "soundcloud":
+        return soundcloud_cover(fid)
+    return None
+
+
+def preset_active(pid: str, src: dict) -> bool:
+    n, d = src.get("name"), src.get("dir") or ""
+    return ((pid == "daily" and n == "netease" and d == "daily")
+            or (pid == "fm" and n == "netease" and d == "fm")
+            or (pid == "library" and n == "folder"))
 
 
 def resolve_netease_input(raw: str) -> tuple[str, str]:
@@ -512,7 +587,14 @@ class Handler(BaseHTTPRequestHandler):
                     del _listeners[k]
                 count = len(_listeners)
             st = radio_status()
-            self._json(200, {"source": st.get("source"), "listeners": count})
+            src = st.get("source")
+            self._json(200, {
+                "source": src,
+                "listeners": count,
+                "cover": np_cover(src) if src else None,
+                "preset": next((p for p, _, _ in PUBLIC_PRESETS if src and preset_active(p, src)), ""),
+                "presets": [{"id": p, "label": l} for p, l, _ in PUBLIC_PRESETS],
+            })
             return
 
         if not self._authed():
@@ -542,6 +624,9 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- POST ----
     def do_POST(self):
+        # /np/preset 与 /np/skip: 公开点播控制 (白名单命令 + 全局冷却, 免 Bearer)
+        if self.path in ("/np/preset", "/np/skip"):
+            return self.public_switch()
         if not self._authed():
             self._json(401, {"error": "unauthorized"})
             return
@@ -563,6 +648,33 @@ class Handler(BaseHTTPRequestHandler):
             self.api_bandcamp_search()
         else:
             self._json(404, {"error": "not found"})
+
+    def public_switch(self):
+        """公开端点: /np/preset {"id"} 切频道, /np/skip 下一首。
+        白名单命令直接写 cmd.fifo; 全局冷却 NP_CMD_COOLDOWN 秒, 超限 429。"""
+        global _np_cmd_ts
+        if self.path == "/np/skip":
+            line = "skip"
+        else:
+            req = self._read_json()
+            pid = str((req or {}).get("id", ""))
+            line = next((c for i, _, c in PUBLIC_PRESETS if i == pid), None)
+            if not line:
+                return self._json(400, {"error": "unknown preset"})
+        with _np_cmd_lock:
+            wait = NP_CMD_COOLDOWN - (time.time() - _np_cmd_ts)
+            if wait > 0:
+                return self._json(429, {"error": "cooldown", "retry_after": round(wait, 1)})
+            if not CMD_FIFO.exists():
+                return self._json(503, {"error": "radiod not running (no cmd.fifo)"})
+            try:
+                with CMD_FIFO.open("w") as f:
+                    f.write(line + "\n")
+            except OSError as e:
+                return self._json(500, {"error": f"fifo write failed: {e}"})
+            _np_cmd_ts = time.time()
+        print(f"public switch: {line}", flush=True)
+        self._json(200, {"ok": True, "sent": line})
 
     def _read_json(self):
         try:
