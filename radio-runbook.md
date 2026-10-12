@@ -90,6 +90,7 @@ radio-admin.service # 管理面板后端 (python3, 127.0.0.1:8811): /admin 的 A
 | `/usr/local/bin/bilibili-helper`   | B站辅助: 纯游客WBI鉴权/单视频分P/收藏夹/合集与系列/搜索/DASH音频拉流与超长守护 (2026-09-19~20) |
 | `/usr/local/bin/youtube-helper`    | YouTube 辅助: 智能URL解析/单视频/歌单批量/关键词搜索/DASH Opus拉流与超长接力 (2026-09-20) |
 | `/usr/local/bin/bandcamp-helper`   | Bandcamp 辅助: 智能URL解析/单曲/专辑/艺人全库并发展开/搜索点歌/MP3拉流 (2026-10-10) |
+| `/usr/local/bin/spotify-event`     | Spotify Connect 辅助: librespot --onevent 实时曲目/艺人上报与状态感知 (2026-10-12) |
 | `/usr/local/bin/yt-dlp`            | YouTube 核心解析引擎 (Linux x86_64 standalone, 2026.08.19) |
 | `/usr/local/bin/deno`              | Deno JS 运行时 (用于 yt-dlp 原生解密计算，消除签名告警) |
 | `/usr/local/bin/radio-admin`| 管理面板后端 (python3, 8811; 面板页 admin-panel.html 同目录) |

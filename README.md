@@ -36,7 +36,7 @@
 ## 🌟 核心特性
 
 - **多音源自由切换**:
-  - 🟢 **Spotify Connect**: VPS 注册为远程音箱设备，手机/电脑 Spotify 客户端一键投播点歌。
+  - 🟢 **Spotify Connect**: VPS 注册为远程音箱设备，手机/电脑 Spotify 客户端一键投播点歌，通过 librespot `--onevent` 实时同步曲目与艺人信息至全站 Now Playing。
   - 🎵 **网易云音乐 (Netease)**: 歌单/专辑循环、私人 FM、每日推荐、播客电台、关键词搜索点歌；内置 `X-Real-IP` 穿透解决海外机房限制。
   - ⚡ **Bilibili (B站)**: 纯游客 0 账号免登录（WBI 动态签名缓存）；支持单视频、分 P、公开收藏夹、UP 主合集/系列、关键词搜索；超长音频（>2h）后台自动断点接力续播。
   - ▶️ **YouTube**: 单视频、歌单、Shorts 短视频、关键词搜索；DASH Opus 160k 纯音频直接拉流；支持联动本地 Cloudflare WARP SOCKS5 代理出口，免疫机房 IP 人机拦截与 403 阻断；支持 >2h 自动换 Token 断点续播。
@@ -78,7 +78,7 @@
 
 ```bash
 # 本地上传安装包
-scp install.sh radiod.sh radiod.service radioctl radio-admin radio-admin.service root@<VPS_IP>:/tmp/
+scp install.sh radiod.sh spotify-event radiod.service radioctl radio-admin radio-admin.service root@<VPS_IP>:/tmp/
 
 # 登入 VPS 并运行一键安装
 ssh root@<VPS_IP>

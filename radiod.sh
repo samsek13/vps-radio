@@ -48,6 +48,7 @@ YOUTUBE_HELPER="/usr/local/bin/youtube-helper"
 YT_SEARCH_CACHE="$RUN_DIR/youtube_search.cache"  # radioctl search 写 / list search-cache 读 (预建 666)
 BANDCAMP_HELPER="/usr/local/bin/bandcamp-helper"
 BC_SEARCH_CACHE="$RUN_DIR/bandcamp_search.cache"  # radioctl search 写 / list search-cache 读 (预建 666)
+SPOTIFY_EVENT_HELPER="/usr/local/bin/spotify-event"
 # netease 音源运行态复用 folder 的 PLAYLIST/PLAY_IDX/PLAY_ORDER:
 #   PLAYLIST 元素 = "<歌曲id> <歌名>" (id=首token; 歌名的 | / CR / LF 已由 helper 清洗)
 #   PLAY_DIR = 上下文: playlist:<id> | album:<id> | podcast:<id> | program:<id> | fm | daily | search
@@ -215,11 +216,14 @@ scan_folder() {
 start_spotify() {
     # Spotify Connect 接收端. pipe 后端输出固定 S16LE/44.1k/立体声, 与总线输入格式一致
     SRC_NAME="spotify"; SRC_FILE=""
+    local event_args=()
+    [ -x "$SPOTIFY_EVENT_HELPER" ] && event_args=(--onevent "$SPOTIFY_EVENT_HELPER")
     librespot \
         --name "$LIBRESPOT_NAME" \
         --backend pipe --bitrate "$SPOTIFY_BITRATE" \
         --disable-audio-cache --volume-ctrl fixed \
         --cache "$CACHE_DIR" \
+        "${event_args[@]}" \
         > "$AUDIO_FIFO" &
     SRC_PID=$!
     write_state; write_last
@@ -804,6 +808,22 @@ handle_cmd() {
         switch-to-spotify)
             stop_source
             start_spotify
+            ;;
+        spotify-track)
+            if [ "$SRC_NAME" = "spotify" ]; then
+                SRC_FILE="$rest"
+                write_state
+                write_last
+                log "spotify: $SRC_FILE"
+            fi
+            ;;
+        spotify-stop)
+            if [ "$SRC_NAME" = "spotify" ]; then
+                SRC_FILE=""
+                write_state
+                write_last
+                log "spotify: stopped"
+            fi
             ;;
         switch-to-file)
             local f="$rest" ss=""

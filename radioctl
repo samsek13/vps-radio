@@ -92,7 +92,14 @@ case "${1:-status}" in
             IFS='|' read -r name dir file idx total order ts < "$STATE_FILE"
             ago=$(( $(date +%s) - ts ))
             case "$name" in
-                spotify) echo "当前音源: spotify (VPS Radio in Spotify Connect)" ;;
+                spotify)
+                    echo "当前音源: spotify (VPS Radio in Spotify Connect)"
+                    if [ -n "$file" ]; then
+                        echo "  正在播放: ${file#* } (id=${file%% *})"
+                    else
+                        echo "  (待机中，手机/电脑 Spotify 选 \"VPS Radio\" 放歌)"
+                    fi
+                    ;;
                 file)
                     echo "当前音源: file — 单曲循环 $(basename "$file")"
                     echo "  $file"

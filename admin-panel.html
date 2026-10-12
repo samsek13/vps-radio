@@ -401,7 +401,7 @@ async function refreshStatus() {
       const ctxMap = src.name === "soundcloud" ? SC_CTX_PRETTY : (src.name === "bilibili" ? BILI_CTX_PRETTY : (src.name === "youtube" ? YT_CTX_PRETTY : (src.name === "bandcamp" ? BC_CTX_PRETTY : CTX_PRETTY)));
       let ctx = src.dir || "";
       for (const [k, v] of Object.entries(ctxMap)) if (ctx.startsWith(k)) { ctx = v + ctx.slice(k.length); break; }
-      const isPlaylistSrc = (src.name === "netease" || src.name === "soundcloud" || src.name === "bilibili" || src.name === "youtube" || src.name === "bandcamp");
+      const isPlaylistSrc = ["netease", "soundcloud", "bilibili", "youtube", "bandcamp", "spotify"].includes(src.name);
       $("#stSource").innerHTML = `音源: <b>${name}</b>` + (src.dir && isPlaylistSrc ? ` — ${ctx}` : "");
       let track = "—";
       if (isPlaylistSrc && src.file) track = src.file.split(" ").slice(1).join(" ") || src.file.split(" ")[0];

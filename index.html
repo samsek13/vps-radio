@@ -1021,7 +1021,7 @@ function renderSeats(n) {
 }
 
 /* ================= Now Playing (/np 12s 轮询) ================= */
-// 音源名 + 曲目。spotify 源时服务端拿不到曲目 (librespot 不上报), 显示引导文案
+// 音源名 + 曲目。支持网易云、SC、B站、YouTube、Bandcamp 以及 Spotify Connect (onevent 自动上报) 实时曲目
 const SRC_NAMES = { spotify: "SPOTIFY", file: "本地文件", folder: "媒体库", netease: "网易云", soundcloud: "SOUNDCLOUD", bilibili: "BILIBILI", youtube: "YOUTUBE", bandcamp: "BANDCAMP" };
 const CTX_NAMES = { "playlist:": "歌单", "album:": "专辑", fm: "私人 FM", daily: "每日推荐", search: "搜索点歌", "likes:": "Likes" };
 const SC_CTX_NAMES = { "playlist:": "歌单", search: "搜索点歌" };
@@ -1064,8 +1064,11 @@ async function refreshNP() {
       ? s.source.idx + "/" + s.source.total : "";
     let track = "";
     if (s.source && s.source.file) {
-      if (s.source.name === "netease" || s.source.name === "soundcloud") track = s.source.file.split(" ").slice(1).join(" ") || s.source.file;
-      else track = s.source.file.split("/").pop();
+      if (["netease", "soundcloud", "bilibili", "youtube", "bandcamp", "spotify"].includes(s.source.name)) {
+        track = s.source.file.split(" ").slice(1).join(" ") || s.source.file;
+      } else {
+        track = s.source.file.split("/").pop();
+      }
     } else if (s.source && s.source.name === "spotify") {
       track = "Spotify 同步";
     }

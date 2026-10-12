@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# spotify-event: librespot --onevent 外部事件处理器
+# 由 librespot 在播放状态变化时以 radiod 用户身份触发
+set -euo pipefail
+
+CMD_FIFO="/run/radiod/cmd.fifo"
+[ -p "$CMD_FIFO" ] || exit 0
+
+event="${PLAYER_EVENT:-}"
+
+case "$event" in
+    track_changed)
+        name="${NAME:-}"
+        artists="${ARTISTS:-}"
+        track_id="${TRACK_ID:-}"
+        show_name="${SHOW_NAME:-}"
+
+        title="$name"
+        if [ -n "$artists" ]; then
+            if [ -n "$title" ]; then
+                title="$title - $artists"
+            else
+                title="$artists"
+            fi
+        elif [ -n "$show_name" ]; then
+            if [ -n "$title" ]; then
+                title="$title - $show_name"
+            else
+                title="$show_name"
+            fi
+        fi
+
+        # 净化换行与竖线 (竖线是 source.state 的字段分隔符)
+        title="$(printf '%s' "$title" | tr '|\r\n' '/  ' | sed 's/  */ /g; s/^ *//; s/ *$//')"
+        [ -z "$title" ] && title="Spotify 曲目"
+
+        # 与系统其他流媒体音源对齐: 格式为 "<track_id> <title>"
+        if [ -n "$track_id" ]; then
+            entry="${track_id} ${title}"
+        else
+            entry="spotify ${title}"
+        fi
+
+        printf 'spotify-track %s\n' "$entry" > "$CMD_FIFO" 2>/dev/null || true
+        ;;
+    stopped|session_disconnected)
+        printf 'spotify-stop\n' > "$CMD_FIFO" 2>/dev/null || true
+        ;;
+    *)
+        ;;
+esac
