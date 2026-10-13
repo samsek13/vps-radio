@@ -335,13 +335,13 @@
   .pitch-label { left: 694px; top: 462px; }
 
   /* ================= START / STOP 实体键 ================= */
-  .ssplate {  /* 按键沉板 */
-    position: absolute; left: 34px; top: 454px; width: 108px; height: 72px; border-radius: 8px;
+  .ssplate {  /* 按键沉板: 容纳 START/STOP 与 SKIP */
+    position: absolute; left: 34px; top: 454px; width: 176px; height: 72px; border-radius: 8px;
     background: linear-gradient(180deg, #1d1e22, #222327);
     box-shadow: inset 0 2px 7px rgba(0,0,0,.75), 0 1px 0 rgba(255,255,255,.05);
   }
   .startstop {
-    position: absolute; left: 42px; top: 462px; width: 92px; height: 56px;
+    position: absolute; left: 42px; top: 462px; width: 88px; height: 56px;
     border: 0; border-radius: 5px; cursor: pointer;
     font: 700 10px/1.5 "Courier New", monospace; letter-spacing: .22em; color: #9a9ea6;
     background: linear-gradient(180deg, #3a3b41, #26272b 60%, #1f2023);
@@ -365,9 +365,41 @@
     background: #ffb54d;
     box-shadow: 0 0 8px rgba(255,170,70,.8), inset 0 0 2px rgba(255,255,255,.4);
   }
+
+  /* SKIP 切歌键 (沉板右侧) */
+  .skipbtn {
+    position: absolute; left: 136px; top: 462px; width: 66px; height: 56px;
+    border: 0; border-radius: 5px; cursor: pointer;
+    font: 700 9px/1.4 "Courier New", monospace; letter-spacing: .15em; color: #9a9ea6;
+    background: linear-gradient(180deg, #3a3b41, #26272b 60%, #1f2023);
+    box-shadow:
+      0 5px 0 #101113, 0 8px 14px rgba(0,0,0,.55),
+      inset 0 1px 0 rgba(255,255,255,.14), inset 0 0 0 1px rgba(0,0,0,.55);
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px;
+    transition: transform .05s, box-shadow .05s, opacity .2s;
+  }
+  .skipbtn:active, .skipbtn.pressed {
+    transform: translateY(4px);
+    box-shadow:
+      0 1px 0 #101113, 0 3px 6px rgba(0,0,0,.5),
+      inset 0 1px 0 rgba(255,255,255,.1), inset 0 2px 8px rgba(0,0,0,.55), inset 0 0 0 1px rgba(0,0,0,.55);
+  }
+  .skipbtn:disabled {
+    cursor: not-allowed; opacity: .6; transform: none;
+    box-shadow: 0 2px 0 #101113, inset 0 0 0 1px rgba(0,0,0,.4);
+  }
+  .skiplamp {
+    width: 20px; height: 4px; border-radius: 2px;
+    background: #23302b; transition: background .3s, box-shadow .3s;
+  }
+  .skipbtn.flash .skiplamp {
+    background: #57f0c8;
+    box-shadow: 0 0 8px rgba(87,240,200,.9), inset 0 0 2px rgba(255,255,255,.6);
+  }
+
   /* ================= 听众座位灯 (调音台电平表式, 表头窗) ================= */
   .seats-wrap {
-    position: absolute; left: 168px; top: 502px; padding: 5px 9px; border-radius: 4px;
+    position: absolute; left: 226px; top: 502px; padding: 5px 9px; border-radius: 4px;
     background: linear-gradient(180deg, #191a1d, #131417);
     box-shadow: inset 0 2px 5px rgba(0,0,0,.85), 0 1px 0 rgba(255,255,255,.05), inset 0 0 0 1px rgba(0,0,0,.5);
   }
@@ -385,7 +417,7 @@
     background: linear-gradient(180deg, #ffc46a, #d98a26);
     box-shadow: 0 0 7px rgba(255,170,70,.65), inset 0 1px 1px rgba(255,255,255,.35);
   }
-  .seats-label { left: 172px; top: 486px; font-size: 8px; letter-spacing: .34em; }
+  .seats-label { left: 230px; top: 486px; font-size: 8px; letter-spacing: .34em; }
 
   .brand {
     right: 34px; top: 510px; text-align: right; font-size: 10px;
@@ -412,9 +444,12 @@
   .deck.portrait .armrest { left: 346px; top: 400px; }
   .deck.portrait .pitch { left: 372px; top: 450px; }
   .deck.portrait .pitch-label { left: auto; right: 16px; top: 578px; }
-  .deck.portrait .ssplate { left: 16px; top: 530px; }
-  .deck.portrait .startstop { left: 24px; top: 538px; }
-  .deck.portrait .seats-wrap { left: 140px; top: 594px; }
+  .deck.portrait .ssplate { left: 14px; top: 530px; width: 156px; }
+  .deck.portrait .startstop { left: 20px; top: 538px; width: 78px; }
+  .deck.portrait .skipbtn { left: 104px; top: 538px; width: 60px; }
+  .deck.portrait .seats-wrap { left: 184px; top: 594px; }
+  .deck.portrait .seats i { width: 5px; }
+  .deck.portrait .seats { gap: 2.5px; }
   .deck.portrait .seats i { width: 6px; }
   .deck.portrait .seats { gap: 3px; }
   .deck.portrait .seats-label { display: none; }
@@ -475,7 +510,8 @@
   <div class="silk pitch-label">PITCH ±8%</div>
 
   <div class="ssplate"></div>
-  <button class="startstop" id="btnStart"><span class="sslamp"></span><span>START<br>STOP</span></button>
+  <button class="startstop" id="btnStart" title="播放 / 暂停"><span class="sslamp"></span><span>START<br>STOP</span></button>
+  <button class="skipbtn" id="btnSkip" title="切到下一首 (SKIP)"><span class="skiplamp"></span><span>SKIP<br>▶▶|</span></button>
 
   <div class="seats-wrap"><div class="seats" id="seats"></div></div>
   <div class="silk seats-label">AUDIENCE</div>
@@ -955,6 +991,70 @@ btnStart.addEventListener("click", () => {
   setPlaying(false);
   setState("已暂停");
 });
+
+/* ================= SKIP 切歌实体键交互 ================= */
+const btnSkip = document.getElementById("btnSkip");
+let skipCooldownTimer = null;
+let skipCooldownSec = 0;
+
+function setSkipCooldown(seconds) {
+  skipCooldownSec = seconds;
+  btnSkip.disabled = true;
+  btnSkip.classList.remove("flash");
+  clearInterval(skipCooldownTimer);
+  const origHtml = "SKIP<br>▶▶|";
+  const labelEl = btnSkip.querySelector("span:last-child");
+  if (labelEl) labelEl.innerHTML = `${skipCooldownSec}S`;
+  skipCooldownTimer = setInterval(() => {
+    skipCooldownSec--;
+    if (skipCooldownSec <= 0) {
+      clearInterval(skipCooldownTimer);
+      btnSkip.disabled = false;
+      if (labelEl) labelEl.innerHTML = origHtml;
+    } else {
+      if (labelEl) labelEl.innerHTML = `${skipCooldownSec}S`;
+    }
+  }, 1000);
+}
+
+if (btnSkip) {
+  btnSkip.addEventListener("click", async () => {
+    if (btnSkip.disabled) return;
+    clickSound(520, 0.05, 0.25);
+    btnSkip.classList.add("flash", "pressed");
+    setTimeout(() => btnSkip.classList.remove("pressed"), 100);
+
+    // 换歌转盘轻微抖动包络 + 荧光屏瞬时提示
+    bump = 0.8;
+    vfdFlicker(() => {
+      const origTrack = trackText;
+      trackText = "切歌中 SKIP...";
+      renderVfd();
+      setTimeout(() => {
+        if (trackText === "切歌中 SKIP...") {
+          trackText = origTrack;
+          renderVfd();
+        }
+      }, 2000);
+    });
+
+    try {
+      const r = await fetch("/np/skip", { method: "POST" });
+      const data = await r.json().catch(() => ({}));
+      if (r.ok) {
+        setSkipCooldown(8);
+        setTimeout(refreshNP, 1500);
+      } else if (r.status === 429) {
+        const retryAfter = Math.ceil(data.retry_after || 5);
+        setSkipCooldown(retryAfter);
+      } else {
+        setTimeout(() => btnSkip.classList.remove("flash"), 400);
+      }
+    } catch (e) {
+      setTimeout(() => btnSkip.classList.remove("flash"), 400);
+    }
+  });
+}
 
 audio.volume = 1;   // 无音量轴, 音量交给系统/设备
 
