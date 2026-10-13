@@ -334,16 +334,16 @@
   .pitch-thumb::after { content: ""; position: absolute; left: 4px; right: 4px; top: 6px; height: 2px; background: rgba(0,0,0,.45); }
   .pitch-label { left: 694px; top: 462px; }
 
-  /* ================= START / STOP 实体键 ================= */
-  .ssplate {  /* 按键沉板: 容纳 START/STOP 与 SKIP */
-    position: absolute; left: 34px; top: 454px; width: 176px; height: 72px; border-radius: 8px;
+  /* ================= START / STOP 与 SKIP 实体键 ================= */
+  .ssplate {  /* 按键沉板: 紧凑容纳 START/STOP 与 SKIP，右界 X=142px，完全避开唱盘井弧线 */
+    position: absolute; left: 26px; top: 457px; width: 116px; height: 68px; border-radius: 8px;
     background: linear-gradient(180deg, #1d1e22, #222327);
     box-shadow: inset 0 2px 7px rgba(0,0,0,.75), 0 1px 0 rgba(255,255,255,.05);
   }
   .startstop {
-    position: absolute; left: 42px; top: 462px; width: 88px; height: 56px;
+    position: absolute; left: 32px; top: 463px; width: 60px; height: 56px;
     border: 0; border-radius: 5px; cursor: pointer;
-    font: 700 10px/1.5 "Courier New", monospace; letter-spacing: .22em; color: #9a9ea6;
+    font: 700 9.5px/1.4 "Courier New", monospace; letter-spacing: .16em; color: #9a9ea6;
     background: linear-gradient(180deg, #3a3b41, #26272b 60%, #1f2023);
     box-shadow:
       0 5px 0 #101113, 0 8px 14px rgba(0,0,0,.55),
@@ -358,7 +358,7 @@
       inset 0 1px 0 rgba(255,255,255,.1), inset 0 2px 8px rgba(0,0,0,.55), inset 0 0 0 1px rgba(0,0,0,.55);
   }
   .sslamp {
-    width: 26px; height: 5px; border-radius: 2px;
+    width: 22px; height: 4px; border-radius: 2px;
     background: #3a2a1a; transition: background .3s, box-shadow .3s;
   }
   .startstop.on .sslamp {
@@ -366,11 +366,11 @@
     box-shadow: 0 0 8px rgba(255,170,70,.8), inset 0 0 2px rgba(255,255,255,.4);
   }
 
-  /* SKIP 切歌键 (沉板右侧) */
+  /* SKIP 切歌键 (沉板右侧, X=98~136px, 距唱盘边缘留白 >25px) */
   .skipbtn {
-    position: absolute; left: 136px; top: 462px; width: 66px; height: 56px;
+    position: absolute; left: 98px; top: 463px; width: 38px; height: 56px;
     border: 0; border-radius: 5px; cursor: pointer;
-    font: 700 9px/1.4 "Courier New", monospace; letter-spacing: .15em; color: #9a9ea6;
+    font: 700 8.5px/1.35 "Courier New", monospace; letter-spacing: .12em; color: #9a9ea6;
     background: linear-gradient(180deg, #3a3b41, #26272b 60%, #1f2023);
     box-shadow:
       0 5px 0 #101113, 0 8px 14px rgba(0,0,0,.55),
@@ -389,7 +389,7 @@
     box-shadow: 0 2px 0 #101113, inset 0 0 0 1px rgba(0,0,0,.4);
   }
   .skiplamp {
-    width: 20px; height: 4px; border-radius: 2px;
+    width: 16px; height: 4px; border-radius: 2px;
     background: #23302b; transition: background .3s, box-shadow .3s;
   }
   .skipbtn.flash .skiplamp {
@@ -399,7 +399,7 @@
 
   /* ================= 听众座位灯 (调音台电平表式, 表头窗) ================= */
   .seats-wrap {
-    position: absolute; left: 226px; top: 502px; padding: 5px 9px; border-radius: 4px;
+    position: absolute; left: 168px; top: 502px; padding: 5px 9px; border-radius: 4px;
     background: linear-gradient(180deg, #191a1d, #131417);
     box-shadow: inset 0 2px 5px rgba(0,0,0,.85), 0 1px 0 rgba(255,255,255,.05), inset 0 0 0 1px rgba(0,0,0,.5);
   }
@@ -417,7 +417,7 @@
     background: linear-gradient(180deg, #ffc46a, #d98a26);
     box-shadow: 0 0 7px rgba(255,170,70,.65), inset 0 1px 1px rgba(255,255,255,.35);
   }
-  .seats-label { left: 230px; top: 486px; font-size: 8px; letter-spacing: .34em; }
+  .seats-label { left: 172px; top: 486px; font-size: 8px; letter-spacing: .34em; }
 
   .brand {
     right: 34px; top: 510px; text-align: right; font-size: 10px;
@@ -444,12 +444,10 @@
   .deck.portrait .armrest { left: 346px; top: 400px; }
   .deck.portrait .pitch { left: 372px; top: 450px; }
   .deck.portrait .pitch-label { left: auto; right: 16px; top: 578px; }
-  .deck.portrait .ssplate { left: 14px; top: 530px; width: 156px; }
-  .deck.portrait .startstop { left: 20px; top: 538px; width: 78px; }
-  .deck.portrait .skipbtn { left: 104px; top: 538px; width: 60px; }
-  .deck.portrait .seats-wrap { left: 184px; top: 594px; }
-  .deck.portrait .seats i { width: 5px; }
-  .deck.portrait .seats { gap: 2.5px; }
+  .deck.portrait .ssplate { left: 14px; top: 530px; width: 140px; }
+  .deck.portrait .startstop { left: 20px; top: 538px; width: 72px; }
+  .deck.portrait .skipbtn { left: 96px; top: 538px; width: 50px; }
+  .deck.portrait .seats-wrap { left: 168px; top: 594px; }
   .deck.portrait .seats i { width: 6px; }
   .deck.portrait .seats { gap: 3px; }
   .deck.portrait .seats-label { display: none; }
