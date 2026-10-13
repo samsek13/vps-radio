@@ -27,7 +27,7 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 CONFIG_PATH = os.environ.get("SPOTIFY_AUTH_FILE", "/var/lib/radiod/spotify_auth.json")
-DEFAULT_REDIRECT_URI = "https://localhost:8888/callback"
+DEFAULT_REDIRECT_URI = "http://127.0.0.1:3000/api/spotify/callback"
 DEFAULT_SCOPES = "user-modify-playback-state user-read-playback-state"
 HTTP_TIMEOUT = 10
 

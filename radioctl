@@ -209,7 +209,7 @@ case "${1:-status}" in
                 else
                     echo "=== Spotify Web API 授权向导 ==="
                     echo "1. 访问 https://developer.spotify.com/dashboard 创建 App"
-                    echo "2. 在 App 设置中添加 Redirect URI: https://localhost:8888/callback"
+                    echo "2. 在 App 设置中添加 Redirect URI: http://127.0.0.1:3000/api/spotify/callback"
                     echo ""
                     read -rp "请输入 Client ID: " cid
                     read -rp "请输入 Client Secret: " csec
@@ -221,7 +221,7 @@ case "${1:-status}" in
                     echo "请在浏览器打开以下链接完成登录授权:"
                     echo "$auth_url"
                     echo ""
-                    echo "授权后浏览器会跳转到无法访问的页面 (形如 https://localhost:8888/callback?code=AQD...)"
+                    echo "授权后浏览器会跳转 (形如 http://127.0.0.1:3000/api/spotify/callback?code=AQD...)"
                     read -rp "请粘贴跳转后地址栏中的完整 URL 或 code 参数值: " code_raw
                     code="$code_raw"
                     pat='[?&]code=([^&]+)'

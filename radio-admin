@@ -1068,7 +1068,7 @@ class Handler(BaseHTTPRequestHandler):
             code = req.get("code", "").strip()
             cid = req.get("client_id", "").strip()
             csec = req.get("client_secret", "").strip()
-            ruri = req.get("redirect_uri", "").strip() or "https://localhost:8888/callback"
+            ruri = req.get("redirect_uri", "").strip() or "http://127.0.0.1:3000/api/spotify/callback"
             if not code or not cid or not csec:
                 return self._json(400, {"error": "code, client_id, client_secret 不能为空"})
             r = subprocess.run([str(SPOTIFY_HELPER), "auth-exchange", code, cid, csec, ruri], capture_output=True, text=True, timeout=15)
@@ -1078,7 +1078,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"error": (r.stderr or r.stdout or "交换 Token 失败").strip()[:300]})
         elif action == "url":
             cid = req.get("client_id", "").strip()
-            ruri = req.get("redirect_uri", "").strip() or "https://localhost:8888/callback"
+            ruri = req.get("redirect_uri", "").strip() or "http://127.0.0.1:3000/api/spotify/callback"
             if not cid:
                 return self._json(400, {"error": "client_id 不能为空"})
             r = subprocess.run([str(SPOTIFY_HELPER), "auth-url", cid, ruri], capture_output=True, text=True, timeout=10)
