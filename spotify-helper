@@ -1,0 +1,414 @@
+#!/usr/bin/env python3
+"""
+spotify-helper — VPS Radio Spotify Web API 辅助工具
+功能:
+  - 通过 Spotify Web API 控制播放 (下一首、上一首、播放/暂停、状态查询)
+  - 自动管理与刷新 OAuth 2.0 Access Token
+  - 支持 CLI 一键凭据设置与授权引导
+  - 零外部第三方依赖 (纯 Python 3 标准库)
+退出码规范:
+  0  成功
+  22 无活跃播放设备或曲目不可控
+  23 鉴权失败 / API 请求错误 / 网络错误
+  24 参数错误或未配置凭据
+"""
+import os
+import sys
+import json
+import time
+import base64
+import urllib.parse
+import urllib.request
+import urllib.error
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+CONFIG_PATH = os.environ.get("SPOTIFY_AUTH_FILE", "/var/lib/radiod/spotify_auth.json")
+DEFAULT_REDIRECT_URI = "https://localhost:8888/callback"
+DEFAULT_SCOPES = "user-modify-playback-state user-read-playback-state"
+HTTP_TIMEOUT = 10
+
+
+def log_err(msg: str):
+    sys.stderr.write(f"[spotify-helper] 错误: {msg}\n")
+
+
+def load_config() -> dict:
+    if not os.path.exists(CONFIG_PATH):
+        return {}
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        log_err(f"读取凭据文件失败 ({CONFIG_PATH}): {e}")
+        return {}
+
+
+def save_config(cfg: dict):
+    dir_name = os.path.dirname(CONFIG_PATH)
+    if dir_name and not os.path.exists(dir_name):
+        os.makedirs(dir_name, exist_ok=True)
+    temp_path = f"{CONFIG_PATH}.tmp.{os.getpid()}"
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temp_path, CONFIG_PATH)
+    try:
+        os.chmod(CONFIG_PATH, 0o600)
+    except OSError:
+        pass
+
+
+def refresh_access_token(cfg: dict) -> str:
+    client_id = cfg.get("client_id")
+    client_secret = cfg.get("client_secret")
+    refresh_token = cfg.get("refresh_token")
+
+    if not client_id or not client_secret or not refresh_token:
+        log_err("凭据缺失 (需 client_id, client_secret, refresh_token)。请运行: radioctl spotify auth")
+        sys.exit(24)
+
+    token_url = "https://accounts.spotify.com/api/token"
+    data = urllib.parse.urlencode({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+    }).encode("utf-8")
+
+    creds = f"{client_id}:{client_secret}".encode("utf-8")
+    auth_header = "Basic " + base64.b64encode(creds).decode("ascii")
+
+    req = urllib.request.Request(
+        token_url,
+        data=data,
+        headers={
+            "Authorization": auth_header,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "VPSRadio/1.0",
+        },
+        method="POST"
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        err_msg = e.read().decode("utf-8", errors="replace")
+        log_err(f"刷新 Token 失败 (HTTP {e.code}): {err_msg}")
+        sys.exit(23)
+    except Exception as e:
+        log_err(f"连接 Spotify 认证服务失败: {e}")
+        sys.exit(23)
+
+    access_token = body.get("access_token")
+    if not access_token:
+        log_err("刷新 Token 返回未包含 access_token")
+        sys.exit(23)
+
+    expires_in = body.get("expires_in", 3600)
+    cfg["access_token"] = access_token
+    cfg["expires_at"] = int(time.time()) + int(expires_in)
+    if body.get("refresh_token"):
+        cfg["refresh_token"] = body["refresh_token"]
+
+    save_config(cfg)
+    return access_token
+
+
+def get_access_token(force_refresh: bool = False) -> str:
+    cfg = load_config()
+    if not cfg:
+        log_err(f"未配置 Spotify Web API 凭据 ({CONFIG_PATH})。请运行: radioctl spotify auth")
+        sys.exit(24)
+
+    access_token = cfg.get("access_token")
+    expires_at = cfg.get("expires_at", 0)
+
+    # 预留 60 秒缓冲区提前刷新
+    if force_refresh or not access_token or time.time() >= (expires_at - 60):
+        return refresh_access_token(cfg)
+    return access_token
+
+
+def call_spotify_api(method: str, path: str, params: dict = None, body: dict = None):
+    token = get_access_token()
+    base_url = "https://api.spotify.com/v1"
+    url = f"{base_url}{path}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "VPSRadio/1.0",
+    }
+    payload = None
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+        payload = json.dumps(body).encode("utf-8")
+
+    req = urllib.request.Request(url, data=payload, headers=headers, method=method)
+
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            status = resp.status
+            if status == 204:
+                return {}
+            resp_data = resp.read().decode("utf-8")
+            if not resp_data:
+                return {}
+            return json.loads(resp_data)
+    except urllib.error.HTTPError as e:
+        # 如果是 401 可能是 token 临时失效，强制刷新一次重试
+        if e.code == 401:
+            token = get_access_token(force_refresh=True)
+            headers["Authorization"] = f"Bearer {token}"
+            retry_req = urllib.request.Request(url, data=payload, headers=headers, method=method)
+            try:
+                with urllib.request.urlopen(retry_req, timeout=HTTP_TIMEOUT) as resp:
+                    if resp.status == 204:
+                        return {}
+                    resp_data = resp.read().decode("utf-8")
+                    return json.loads(resp_data) if resp_data else {}
+            except urllib.error.HTTPError as e2:
+                e = e2
+
+        err_body = e.read().decode("utf-8", errors="replace")
+        try:
+            err_json = json.loads(err_body)
+            msg = err_json.get("error", {}).get("message", err_body)
+        except Exception:
+            msg = err_body
+
+        if e.code == 404:
+            log_err(f"Spotify 暂无活跃播放设备或当前无播放中的会话 ({msg})")
+            sys.exit(22)
+        elif e.code == 403:
+            log_err(f"操作受限 (需 Spotify Premium 账号或缺少对应权限: {msg})")
+            sys.exit(23)
+        else:
+            log_err(f"Spotify API 请求失败 (HTTP {e.code}): {msg}")
+            sys.exit(23)
+    except Exception as e:
+        log_err(f"网络通信失败: {e}")
+        sys.exit(23)
+
+
+def cmd_next():
+    call_spotify_api("POST", "/me/player/next")
+    print("OK: Spotify 已切换下一首")
+    sys.exit(0)
+
+
+def cmd_prev():
+    call_spotify_api("POST", "/me/player/previous")
+    print("OK: Spotify 已切换上一首")
+    sys.exit(0)
+
+
+def cmd_pause():
+    call_spotify_api("PUT", "/me/player/pause")
+    print("OK: Spotify 已暂停")
+    sys.exit(0)
+
+
+def cmd_play():
+    call_spotify_api("PUT", "/me/player/play")
+    print("OK: Spotify 已继续播放")
+    sys.exit(0)
+
+
+def cmd_status():
+    cfg = load_config()
+    res = {
+        "configured": bool(cfg.get("client_id") and cfg.get("refresh_token")),
+        "config_file": CONFIG_PATH,
+        "token_expires_in": max(0, int(cfg.get("expires_at", 0) - time.time())) if cfg.get("expires_at") else 0,
+        "active_device": None,
+        "is_playing": False,
+        "track": None,
+    }
+
+    if not res["configured"]:
+        print(json.dumps(res, ensure_ascii=False))
+        sys.exit(0)
+
+    try:
+        player_info = call_spotify_api("GET", "/me/player")
+        if player_info:
+            dev = player_info.get("device", {})
+            item = player_info.get("item", {})
+            res["is_playing"] = player_info.get("is_playing", False)
+            if dev:
+                res["active_device"] = {
+                    "name": dev.get("name"),
+                    "type": dev.get("type"),
+                    "is_active": dev.get("is_active"),
+                }
+            if item:
+                artists = ", ".join([a.get("name", "") for a in item.get("artists", [])])
+                res["track"] = {
+                    "id": item.get("id"),
+                    "name": item.get("name"),
+                    "artists": artists,
+                    "duration_ms": item.get("duration_ms"),
+                }
+    except SystemExit:
+        pass
+
+    print(json.dumps(res, ensure_ascii=False))
+    sys.exit(0)
+
+
+def cmd_auth_url(client_id: str, redirect_uri: str = DEFAULT_REDIRECT_URI):
+    params = {
+        "client_id": client_id,
+        "response_type": "code",
+        "redirect_uri": redirect_uri,
+        "scope": DEFAULT_SCOPES,
+    }
+    url = "https://accounts.spotify.com/authorize?" + urllib.parse.urlencode(params)
+    print(url)
+    sys.exit(0)
+
+
+def cmd_auth_exchange(code: str, client_id: str, client_secret: str, redirect_uri: str = DEFAULT_REDIRECT_URI):
+    token_url = "https://accounts.spotify.com/api/token"
+    data = urllib.parse.urlencode({
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": redirect_uri,
+    }).encode("utf-8")
+
+    creds = f"{client_id}:{client_secret}".encode("utf-8")
+    auth_header = "Basic " + base64.b64encode(creds).decode("ascii")
+
+    req = urllib.request.Request(
+        token_url,
+        data=data,
+        headers={
+            "Authorization": auth_header,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "VPSRadio/1.0",
+        },
+        method="POST"
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        err_msg = e.read().decode("utf-8", errors="replace")
+        log_err(f"交换 Token 失败 (HTTP {e.code}): {err_msg}")
+        sys.exit(23)
+    except Exception as e:
+        log_err(f"请求失败: {e}")
+        sys.exit(23)
+
+    refresh_token = body.get("refresh_token")
+    access_token = body.get("access_token")
+    expires_in = body.get("expires_in", 3600)
+
+    if not refresh_token:
+        log_err("返回结果未包含 refresh_token")
+        sys.exit(23)
+
+    cfg = load_config()
+    cfg.update({
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "refresh_token": refresh_token,
+        "access_token": access_token,
+        "expires_at": int(time.time()) + int(expires_in),
+        "redirect_uri": redirect_uri,
+    })
+    save_config(cfg)
+    print(f"OK: Spotify 凭据已成功保存至 {CONFIG_PATH}")
+    sys.exit(0)
+
+
+def cmd_auth_set(client_id: str, client_secret: str, refresh_token: str):
+    cfg = load_config()
+    cfg.update({
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "refresh_token": refresh_token,
+        "access_token": "",
+        "expires_at": 0,
+    })
+    save_config(cfg)
+    # 立即验证并换取首次 access_token
+    access_token = refresh_access_token(cfg)
+    if access_token:
+        print(f"OK: Spotify 凭据已验证有效并保存至 {CONFIG_PATH}")
+        sys.exit(0)
+    else:
+        sys.exit(23)
+
+
+def print_usage():
+    print("""用法: spotify-helper <子命令> [参数...]
+
+控制命令:
+  next | skip               跳到下一首 (POST /v1/me/player/next)
+  prev | previous           跳到上一首 (POST /v1/me/player/previous)
+  pause                     暂停播放 (PUT /v1/me/player/pause)
+  play                      恢复播放 (PUT /v1/me/player/play)
+  status                    输出当前凭据与播放状态 JSON
+
+授权配置命令:
+  auth-url <client_id> [redirect_uri]
+                            生成用于浏览器访问的 OAuth 授权 URL
+  auth-exchange <code> <client_id> <client_secret> [redirect_uri]
+                            使用授权得到的 code 交换并保存 refresh_token
+  auth-set <client_id> <client_secret> <refresh_token>
+                            直接设置并验证已有凭据 (保存至 /var/lib/radiod/spotify_auth.json)
+""", file=sys.stderr)
+    sys.exit(24)
+
+
+def main():
+    if len(sys.argv) < 2:
+        print_usage()
+
+    cmd = sys.argv[1].lower()
+    if cmd in ("next", "skip"):
+        cmd_next()
+    elif cmd in ("prev", "previous"):
+        cmd_prev()
+    elif cmd == "pause":
+        cmd_pause()
+    elif cmd == "play":
+        cmd_play()
+    elif cmd == "status":
+        cmd_status()
+    elif cmd == "auth-url":
+        if len(sys.argv) < 3:
+            log_err("用法: spotify-helper auth-url <client_id> [redirect_uri]")
+            sys.exit(24)
+        cid = sys.argv[2]
+        ruri = sys.argv[3] if len(sys.argv) > 3 else DEFAULT_REDIRECT_URI
+        cmd_auth_url(cid, ruri)
+    elif cmd == "auth-exchange":
+        if len(sys.argv) < 5:
+            log_err("用法: spotify-helper auth-exchange <code> <client_id> <client_secret> [redirect_uri]")
+            sys.exit(24)
+        code = sys.argv[2]
+        cid = sys.argv[3]
+        csec = sys.argv[4]
+        ruri = sys.argv[5] if len(sys.argv) > 5 else DEFAULT_REDIRECT_URI
+        cmd_auth_exchange(code, cid, csec, ruri)
+    elif cmd == "auth-set":
+        if len(sys.argv) < 5:
+            log_err("用法: spotify-helper auth-set <client_id> <client_secret> <refresh_token>")
+            sys.exit(24)
+        cmd_auth_set(sys.argv[2], sys.argv[3], sys.argv[4])
+    else:
+        log_err(f"未知子命令: {cmd}")
+        print_usage()
+
+
+if __name__ == "__main__":
+    main()

@@ -145,6 +145,9 @@ fi
 log "安装 radiod (librespot | ffmpeg 管道) 服务与辅助脚本..."
 install -m 755 radiod.sh /usr/local/bin/radiod.sh
 install -m 755 spotify-event /usr/local/bin/spotify-event
+for h in netease-helper soundcloud-helper bilibili-helper youtube-helper bandcamp-helper spotify-helper radioctl radio-admin; do
+    [ -f "$h" ] && install -m 755 "$h" /usr/local/bin/"$h"
+done
 install -m 644 radiod.service /etc/systemd/system/radiod.service
 
 # ---------- 7. 防火墙 ----------

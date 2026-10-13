@@ -42,6 +42,8 @@ NETEASE_COOKIE = Path("/var/lib/radiod/netease_cookie")
 HELPER = "/usr/local/bin/netease-helper"
 SC_HELPER = "/usr/local/bin/soundcloud-helper"
 TOKEN_FILE = Path("/var/lib/radiod/admin_token")
+SPOTIFY_AUTH_FILE = Path("/var/lib/radiod/spotify_auth.json")
+SPOTIFY_HELPER = Path("/usr/local/bin/spotify-helper")
 PANEL_HTML = Path(__file__).with_name("admin-panel.html")
 
 # ---- 在线人数统计 ----
@@ -137,6 +139,8 @@ ALLOWED_COMMANDS = {
     "skip": lambda a: "skip",
     "seek": lambda a: f"seek {a[0]}",
     "volume": lambda a: f"volume {a[0]}",
+    "spotify-prev": lambda a: "spotify-prev",
+    "spotify-skip": lambda a: "skip",
 }
 # 数字 id 参数命令 (arg0 必须纯数字)
 NUM_ID_CMDS = {
@@ -646,6 +650,8 @@ class Handler(BaseHTTPRequestHandler):
             self.api_youtube_search()
         elif self.path == "/api/bandcamp-search":
             self.api_bandcamp_search()
+        elif self.path == "/api/spotify-auth":
+            self.api_spotify_auth()
         else:
             self._json(404, {"error": "not found"})
 
@@ -1044,6 +1050,46 @@ class Handler(BaseHTTPRequestHandler):
             self._json(502, {"error": (r.stderr or r.stdout or "check failed").strip()[:300]})
 
 
+    def api_spotify_auth(self):
+        req = self._read_json() or {}
+        action = req.get("action", "")
+        if action == "set":
+            cid = req.get("client_id", "").strip()
+            csec = req.get("client_secret", "").strip()
+            refresh = req.get("refresh_token", "").strip()
+            if not cid or not csec or not refresh:
+                return self._json(400, {"error": "client_id, client_secret, refresh_token 均不能为空"})
+            r = subprocess.run([str(SPOTIFY_HELPER), "auth-set", cid, csec, refresh], capture_output=True, text=True, timeout=15)
+            if r.returncode == 0:
+                return self._json(200, {"ok": True, "msg": "Spotify 凭据已保存并验证成功"})
+            else:
+                return self._json(400, {"error": (r.stderr or r.stdout or "验证失败").strip()[:300]})
+        elif action == "exchange":
+            code = req.get("code", "").strip()
+            cid = req.get("client_id", "").strip()
+            csec = req.get("client_secret", "").strip()
+            ruri = req.get("redirect_uri", "").strip() or "https://localhost:8888/callback"
+            if not code or not cid or not csec:
+                return self._json(400, {"error": "code, client_id, client_secret 不能为空"})
+            r = subprocess.run([str(SPOTIFY_HELPER), "auth-exchange", code, cid, csec, ruri], capture_output=True, text=True, timeout=15)
+            if r.returncode == 0:
+                return self._json(200, {"ok": True, "msg": "Spotify 授权成功并已保存"})
+            else:
+                return self._json(400, {"error": (r.stderr or r.stdout or "交换 Token 失败").strip()[:300]})
+        elif action == "url":
+            cid = req.get("client_id", "").strip()
+            ruri = req.get("redirect_uri", "").strip() or "https://localhost:8888/callback"
+            if not cid:
+                return self._json(400, {"error": "client_id 不能为空"})
+            r = subprocess.run([str(SPOTIFY_HELPER), "auth-url", cid, ruri], capture_output=True, text=True, timeout=10)
+            if r.returncode == 0:
+                return self._json(200, {"url": r.stdout.strip()})
+            else:
+                return self._json(400, {"error": (r.stderr or "生成授权 URL 失败").strip()[:300]})
+        else:
+            self._json(400, {"error": f"未知 action: {action}"})
+
+
 # ---- 数据采集 ----
 def radio_status():
     st = {
@@ -1070,6 +1116,11 @@ def radio_status():
         st["netease_logged_in"] = "MUSIC_U=" in NETEASE_COOKIE.read_text()
     except OSError:
         st["netease_logged_in"] = False
+    try:
+        sp_cfg = json.loads(SPOTIFY_AUTH_FILE.read_text())
+        st["spotify_auth_ready"] = bool(sp_cfg.get("client_id") and sp_cfg.get("refresh_token"))
+    except Exception:
+        st["spotify_auth_ready"] = False
     # 最近一次控制命令的处理结果 (radiod 写 cmd.result: "<ts>|<OK|FAIL>|<文本>")。
     # 面板轮询 status 时展示 → 点播"命令送达但没播成"不再静默 (2026-09-15 搜索点歌 bug 的可见化)
     st["last_cmd"] = None

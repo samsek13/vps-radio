@@ -342,6 +342,24 @@ ssh ubuntu@<YOUR_VPS_IP> "ffprobe -v error -show_entries format=duration -of def
   # 授权成功后 Ctrl+C, 凭据已存, 再 systemctl start radiod
   ```
 
+### 5.1 Admin 端 / CLI 切歌控制 (Spotify Web API)
+
+系统支持在 Admin 面板点击“下一首 / 上一首”或通过 `radioctl skip` / `radioctl spotify next` 远程控制 Spotify 换歌：
+1. **首次配置 Web API 授权 (一次性)**:
+   - 运行: `radioctl spotify auth`
+   - 按终端提示输入 Spotify Developer App 的 Client ID 与 Client Secret，复制链接至浏览器完成授权，并粘贴回调 URL/code。
+   - 凭据将安全持久化保存在 `/var/lib/radiod/spotify_auth.json` (chmod 0600)。
+2. **日常切歌**:
+   - **Web 后台**: 直接点击“下一首”或 Spotify 卡片内的“下一首 ▶▶|” / “|◀◀ 上一首”。
+   - **CLI 命令行**:
+     ```bash
+     radioctl skip               # 切下一首
+     radioctl spotify next       # 切下一首
+     radioctl spotify prev       # 切上一首
+     radioctl spotify status     # 查看当前设备与播放曲目 JSON
+     ```
+   - 若未配置凭据，Web 面板会标识“Web API 未配置”，点击切歌时会在最近操作中给出明确配置提示。
+
 ---
 
 ## 6. 排障 (症状 → 根因 → 处置)

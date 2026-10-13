@@ -159,9 +159,16 @@
         <h3><span class="chip">♪</span> Spotify <span class="badge cur">当前</span></h3>
         <div class="row" style="margin-top:0">
           <button data-cmd="spotify">切换到 Spotify</button>
+          <button data-cmd="skip" title="跳到下一首 (调用 Spotify Web API)">下一首 ▶▶|</button>
+          <button data-cmd="spotify-prev" title="跳到上一首 (调用 Spotify Web API)">|◀◀ 上一首</button>
         </div>
         <hr class="divider">
         <div class="lab">手机/电脑 Spotify 里选设备 "VPS Radio" 放歌, 全站同步收听</div>
+        <div style="margin-top:8px; font-size:12px; display:flex; align-items:center; gap:6px;">
+          <span class="dim">Web API 切歌:</span>
+          <span id="spotifyAuthBadge" class="badge">检测中...</span>
+          <button type="button" id="openSpModalBtn" style="padding:2px 8px; font-size:11px; margin-left:auto;">⚙️ 配置授权</button>
+        </div>
       </div>
 
       <div class="src src-media" id="srcMedia">
@@ -430,10 +437,14 @@ async function refreshStatus() {
           else btn.classList.remove("active");
         }
       });
-      // "播放下一首" 仅作用于服务端可控音源; Spotify 模式切歌归手机 Spotify Connect
+      // "播放下一首" (支持所有音源，Spotify 模式调用 Web API)
       const skipBtn = document.getElementById("skipBtn");
-      if (isSpotify) { skipBtn.disabled = true; skipBtn.title = "Spotify 模式请在手机 Spotify 里切歌"; }
-      else { skipBtn.disabled = false; skipBtn.title = src.name === "file" ? "单曲循环模式: 重播当前文件 (库里只有一首时表现为重播)" : ""; }
+      skipBtn.disabled = false;
+      if (isSpotify) {
+        skipBtn.title = s.spotify_auth_ready ? "Spotify 模式: 调用 Web API 跳到下一首" : "Spotify 模式: 请先配置 Web API 授权 (radioctl spotify auth)";
+      } else {
+        skipBtn.title = src.name === "file" ? "单曲循环模式: 重播当前文件 (库里只有一首时表现为重播)" : "";
+      }
       const seekBtn = document.getElementById("seekBtn");
       const seekInput = document.getElementById("seekInput");
       if (seekBtn && seekInput) {
@@ -451,6 +462,18 @@ async function refreshStatus() {
     $("#svcRow").innerHTML = ["radiod", "mediamtx", "caddy", "ncm-api"].map(
       (k) => `<span class="badge ${s[k] ? "ok" : "bad"}">${k} ${s[k] ? "✓" : "✗"}</span>`
     ).join("") + (s.netease_logged_in ? `<span class="badge ok">网易已登录</span>` : `<span class="badge bad">网易未登录</span>`);
+    const spBadge = document.getElementById("spotifyAuthBadge");
+    if (spBadge) {
+      if (s.spotify_auth_ready) {
+        spBadge.className = "badge ok";
+        spBadge.textContent = "已授权 ✓";
+        spBadge.title = "Spotify Web API 已配置，支持 Admin 端切歌";
+      } else {
+        spBadge.className = "badge bad";
+        spBadge.textContent = "未配置 ✗";
+        spBadge.title = "点击右侧 ⚙️ 配置授权 或在终端执行 radioctl spotify auth";
+      }
+    }
     if (typeof s.volume === "number") {
       updateAmpUI(s.volume);
     }
@@ -817,6 +840,103 @@ function startPoll() {
     } catch {}
   }, 2500);
 }
+
+// Spotify Web API 配置弹窗交互
+const spModal = document.getElementById("spModal");
+const openSpModalBtn = document.getElementById("openSpModalBtn");
+const closeSpModalBtn = document.getElementById("closeSpModalBtn");
+const spGenUrlBtn = document.getElementById("spGenUrlBtn");
+const spExchangeBtn = document.getElementById("spExchangeBtn");
+const spModalMsg = document.getElementById("spModalMsg");
+
+if (openSpModalBtn) openSpModalBtn.onclick = () => { spModal.style.display = "flex"; spModalMsg.textContent = ""; };
+if (closeSpModalBtn) closeSpModalBtn.onclick = () => { spModal.style.display = "none"; };
+if (spModal) spModal.onclick = (e) => { if (e.target === spModal) spModal.style.display = "none"; };
+
+if (spGenUrlBtn) {
+  spGenUrlBtn.onclick = async () => {
+    const cid = document.getElementById("spClientId").value.trim();
+    if (!cid) { spModalMsg.innerHTML = '<span style="color:#f87171">请先输入 Client ID</span>'; return; }
+    try {
+      spModalMsg.textContent = "正在生成授权链接...";
+      const r = await fetch("/admin/api/spotify-auth", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "url", client_id: cid })
+      });
+      const d = await r.json();
+      if (d.url) {
+        window.open(d.url, "_blank");
+        spModalMsg.innerHTML = '<span style="color:#4ade80">✓ 已在新窗口打开授权页，在浏览器确认后，将跳转地址栏完整内容粘贴至下方输入框</span>';
+      } else {
+        spModalMsg.innerHTML = `<span style="color:#f87171">${d.error || "生成失败"}</span>`;
+      }
+    } catch (err) {
+      spModalMsg.innerHTML = `<span style="color:#f87171">请求出错: ${err.message}</span>`;
+    }
+  };
+}
+
+if (spExchangeBtn) {
+  spExchangeBtn.onclick = async () => {
+    const cid = document.getElementById("spClientId").value.trim();
+    const csec = document.getElementById("spClientSecret").value.trim();
+    let raw = document.getElementById("spCodeInput").value.trim();
+    if (!cid || !csec) { spModalMsg.innerHTML = '<span style="color:#f87171">Client ID 和 Client Secret 不能为空</span>'; return; }
+    let code = raw;
+    const m = raw.match(/[?&]code=([^&]+)/);
+    if (m) code = m[1];
+    if (!code) { spModalMsg.innerHTML = '<span style="color:#f87171">请粘贴跳转后的地址栏内容或 code</span>'; return; }
+    try {
+      spModalMsg.textContent = "正在保存并验证凭据...";
+      const r = await fetch("/admin/api/spotify-auth", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "exchange", client_id: cid, client_secret: csec, code: code })
+      });
+      const d = await r.json();
+      if (d.ok) {
+        spModalMsg.innerHTML = '<span style="color:#4ade80">✓ 授权成功并已生效！现在可以在后台随时切歌了</span>';
+        setTimeout(() => { spModal.style.display = "none"; refreshStatus(); }, 1500);
+      } else {
+        spModalMsg.innerHTML = `<span style="color:#f87171">绑定失败: ${d.error || "未知错误"}</span>`;
+      }
+    } catch (err) {
+      spModalMsg.innerHTML = `<span style="color:#f87171">请求出错: ${err.message}</span>`;
+    }
+  };
+}
 </script>
+
+<!-- Spotify Web API 配置弹窗 -->
+<div id="spModal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.75); z-index:9999; align-items:center; justify-content:center;">
+  <div style="background:#1e232a; border:1px solid #334155; border-radius:10px; padding:22px; width:480px; max-width:92%; box-shadow:0 12px 36px rgba(0,0,0,0.6); color:#e2e8f0;">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+      <h3 style="margin:0; font-size:16px; font-weight:600; color:#fff;">⚙️ Spotify Web API 切歌授权</h3>
+      <button type="button" id="closeSpModalBtn" style="background:none; border:none; color:#94a3b8; font-size:20px; cursor:pointer; line-height:1; padding:0 4px;">✕</button>
+    </div>
+    <div class="dim" style="font-size:12px; line-height:1.6; margin-bottom:14px; background:#0f172a; padding:10px 12px; border-radius:6px; border:1px solid #1e293b;">
+      <b>一次性配置指引：</b><br>
+      1. 打开 <a href="https://developer.spotify.com/dashboard" target="_blank" style="color:#38bdf8; text-decoration:underline;">Spotify Developer Dashboard</a> 登录并点 <b>Create App</b><br>
+      2. App 的 <b>Redirect URI</b> 必须填入：<code style="color:#fde047; background:#020617; padding:2px 6px; border-radius:4px; font-size:11px;">https://localhost:8888/callback</code><br>
+      3. 在 Settings 复制 Client ID 与 Client Secret 粘贴至下方
+    </div>
+    <div style="display:flex; flex-direction:column; gap:10px;">
+      <label style="font-size:12px; font-weight:500;">Client ID:
+        <input type="text" id="spClientId" placeholder="粘贴你的 Spotify App Client ID" style="width:100%; box-sizing:border-box; margin-top:4px; padding:7px 10px; border-radius:5px; border:1px solid #334155; background:#0f172a; color:#fff; font-size:12px;">
+      </label>
+      <label style="font-size:12px; font-weight:500;">Client Secret:
+        <input type="password" id="spClientSecret" placeholder="粘贴你的 Spotify App Client Secret" style="width:100%; box-sizing:border-box; margin-top:4px; padding:7px 10px; border-radius:5px; border:1px solid #334155; background:#0f172a; color:#fff; font-size:12px;">
+      </label>
+      <button type="button" id="spGenUrlBtn" class="primary" style="padding:8px 12px; margin-top:2px;">🔗 生成并打开授权链接</button>
+      <hr class="divider" style="margin:4px 0; border:none; border-top:1px solid #334155;">
+      <label style="font-size:12px; font-weight:500;">跳转后地址栏 URL:
+        <input type="text" id="spCodeInput" placeholder="直接粘贴浏览器跳转后的地址栏完整内容" style="width:100%; box-sizing:border-box; margin-top:4px; padding:7px 10px; border-radius:5px; border:1px solid #334155; background:#0f172a; color:#fff; font-size:12px;">
+      </label>
+      <button type="button" id="spExchangeBtn" class="primary" style="padding:8px 12px;">💾 完成绑定并保存</button>
+      <div id="spModalMsg" style="font-size:12px; min-height:18px; margin-top:4px; line-height:1.4;"></div>
+    </div>
+  </div>
+</div>
 </body>
 </html>

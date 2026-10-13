@@ -49,6 +49,7 @@ YT_SEARCH_CACHE="$RUN_DIR/youtube_search.cache"  # radioctl search 写 / list se
 BANDCAMP_HELPER="/usr/local/bin/bandcamp-helper"
 BC_SEARCH_CACHE="$RUN_DIR/bandcamp_search.cache"  # radioctl search 写 / list search-cache 读 (预建 666)
 SPOTIFY_EVENT_HELPER="/usr/local/bin/spotify-event"
+SPOTIFY_HELPER="/usr/local/bin/spotify-helper"
 # netease 音源运行态复用 folder 的 PLAYLIST/PLAY_IDX/PLAY_ORDER:
 #   PLAYLIST 元素 = "<歌曲id> <歌名>" (id=首token; 歌名的 | / CR / LF 已由 helper 清洗)
 #   PLAY_DIR = 上下文: playlist:<id> | album:<id> | podcast:<id> | program:<id> | fm | daily | search
@@ -825,6 +826,21 @@ handle_cmd() {
                 log "spotify: stopped"
             fi
             ;;
+        spotify-prev)
+            if [ "$SRC_NAME" = "spotify" ]; then
+                if [ -x "$SPOTIFY_HELPER" ]; then
+                    if out="$("$SPOTIFY_HELPER" prev 2>&1)"; then
+                        note "spotify-prev: 已切到上一首"
+                    else
+                        fail "spotify-prev: 切歌失败 ($out)"
+                    fi
+                else
+                    fail "spotify-prev: 未安装 spotify-helper"
+                fi
+            else
+                fail "spotify-prev: 当前不是 Spotify 音源 ($SRC_NAME)"
+            fi
+            ;;
         switch-to-file)
             local f="$rest" ss=""
             if [ -n "$rest" ] && [ ! -r "$rest" ]; then
@@ -1008,7 +1024,15 @@ handle_cmd() {
                     start_file "$f"
                     ;;
                 spotify)
-                    fail "skip: spotify 模式请用手机 Spotify Connect 控制"
+                    if [ -x "$SPOTIFY_HELPER" ]; then
+                        if out="$("$SPOTIFY_HELPER" next 2>&1)"; then
+                            note "skip: Spotify 已切到下一首"
+                        else
+                            fail "skip: Spotify 切歌失败 ($out)"
+                        fi
+                    else
+                        fail "skip: 未安装 spotify-helper"
+                    fi
                     ;;
                 *)
                     fail "skip: 当前无可跳的音源 ($SRC_NAME)"

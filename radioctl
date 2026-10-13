@@ -67,6 +67,7 @@ YT_HELPER="/usr/local/bin/youtube-helper"
 YT_SEARCH_CACHE="/run/radiod/youtube_search.cache"
 BC_HELPER="/usr/local/bin/bandcamp-helper"
 BC_SEARCH_CACHE="/run/radiod/bandcamp_search.cache"
+SPOTIFY_HELPER="/usr/local/bin/spotify-helper"
 
 usage() { sed -n '2,51p' "$0"; exit "${1:-0}"; }
 
@@ -183,7 +184,65 @@ case "${1:-status}" in
             exit 1
         fi
         ;;
-    spotify)    send "switch-to-spotify" ;;
+    spotify)
+        sub="${2:-}"
+        case "$sub" in
+            next|skip) send "skip" ;;
+            prev)      send "spotify-prev" ;;
+            status)
+                if [ -x "$SPOTIFY_HELPER" ]; then
+                    exec "$SPOTIFY_HELPER" status
+                else
+                    echo "未安装 spotify-helper" >&2; exit 1
+                fi
+                ;;
+            auth)
+                shift 2
+                if [ ! -x "$SPOTIFY_HELPER" ]; then
+                    echo "未安装 spotify-helper" >&2; exit 1
+                fi
+                sub_auth="${1:-}"
+                if [ "$sub_auth" = "set" ] && [ $# -ge 4 ]; then
+                    exec "$SPOTIFY_HELPER" auth-set "$2" "$3" "$4"
+                elif [ $# -ge 3 ] && [ "$sub_auth" != "set" ]; then
+                    exec "$SPOTIFY_HELPER" auth-set "$1" "$2" "$3"
+                else
+                    echo "=== Spotify Web API 授权向导 ==="
+                    echo "1. 访问 https://developer.spotify.com/dashboard 创建 App"
+                    echo "2. 在 App 设置中添加 Redirect URI: https://localhost:8888/callback"
+                    echo ""
+                    read -rp "请输入 Client ID: " cid
+                    read -rp "请输入 Client Secret: " csec
+                    if [ -z "$cid" ] || [ -z "$csec" ]; then
+                        echo "Client ID 和 Client Secret 不能为空" >&2; exit 1
+                    fi
+                    auth_url=$("$SPOTIFY_HELPER" auth-url "$cid")
+                    echo ""
+                    echo "请在浏览器打开以下链接完成登录授权:"
+                    echo "$auth_url"
+                    echo ""
+                    echo "授权后浏览器会跳转到无法访问的页面 (形如 https://localhost:8888/callback?code=AQD...)"
+                    read -rp "请粘贴跳转后地址栏中的完整 URL 或 code 参数值: " code_raw
+                    code="$code_raw"
+                    pat='[?&]code=([^&]+)'
+                    if [[ "$code_raw" =~ $pat ]]; then
+                        code="${BASH_REMATCH[1]}"
+                    fi
+                    if [ -z "$code" ]; then
+                        echo "授权 code 不能为空" >&2; exit 1
+                    fi
+                    "$SPOTIFY_HELPER" auth-exchange "$code" "$cid" "$csec"
+                fi
+                ;;
+            "") send "switch-to-spotify" ;;
+            *)
+                echo "用法: radioctl spotify [next|prev|status|auth]" >&2
+                echo "      radioctl spotify auth                   # 交互式配置 Web API 授权" >&2
+                echo "      radioctl spotify auth <id> <sec> <ref>  # 直接导入凭据" >&2
+                exit 1
+                ;;
+        esac
+        ;;
     file)
         [ $# -ge 2 ] || { echo "用法: radioctl file <绝对路径> [时点]" >&2; exit 1; }
         f="$(abspath "$2")"
